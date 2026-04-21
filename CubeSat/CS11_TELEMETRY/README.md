@@ -1,180 +1,248 @@
-# CS11 — Telemetry Encoder & Command Interface
+# CS11 — Telemetry Encoder & Multiplexer
 
-> Packages ADCS, orbit, laser, and housekeeping data into CCSDS-framed telemetry packets and transmits them over 8N1 UART at 115200 baud; receives and dispatches uplink commands over the same physical interface.
+## 1. Module Title & ID
 
----
-
-## Overview
-
-| Attribute | Value |
-|---|---|
-| Requirements | CS-TLM-001 through CS-TLM-008 |
-| Top module | `telemetry_wrapper` |
-| Clock domain | `sys_clk` (50 MHz) |
-| CE strobes | 1 Hz `ce_1hz` (superframe trigger), 1 kHz `ce_1ms` (arbiter tick) |
-| UART baud | 115,200 bps 8N1 (configurable via `BAUD_HZ`) |
-| Frame format | SYNC(4) \| APID(2) \| SEQ(2) \| LEN(2) \| TS(4) \| PAYLOAD(N) \| CRC16(2) |
-| Superframe | HK@0ms, ADCS@100ms, ORBIT@200ms, LASER@300ms |
-| BRAM | 768 B |
-| DSP48 | 0 |
+**Module:** CS11 — Telemetry Encoder & Multiplexer (CCSDS)
+**Subsystem ID:** CS11
+**Requirements:** CS-TLM-001 through CS-TLM-008
 
 ---
 
-## File Structure
+## 2. Overview
 
-| File | Purpose |
-|---|---|
-| `telemetry_wrapper.sv` | Top-level — integrates downlink and uplink paths |
-| `tlm_arbiter.sv` | Superframe scheduler; selects payload channel per slot |
-| `ccsds_encoder.sv` | CCSDS-aligned framing: SYNC + header + payload + CRC16 |
-| `command_decoder.sv` | UART RX; sync detection; CRC16 validation; field extraction |
-| `command_dispatcher.sv` | Routes decoded commands to AXI4-Lite write channel |
-| `tle_parser.sv` | Decodes 69-char ASCII TLE bytes for CS9 uplink |
-| `tb_telemetry_wrapper.sv` | Self-checking directed testbench |
+CS11 assembles and transmits CCSDS-compatible telemetry frames over UART at up to 115,200 bps. It schedules four packet types (HK, ADCS, Orbit, Laser) in a 1-second superframe, builds framed packets with SYNC + APID + sequence counter + timestamp + payload + CRC-16/CCITT-FALSE, and serialises them to the UART TX output. An uplink path (UART RX) decodes incoming command frames, validates CRC, and dispatches routing via AXI4-Lite master writes to target subsystem registers.
 
-Shared primitives used: `uart_controller.sv`, `crc_calc.sv`, `async_fifo.sv`, `mavlink_parser.sv`.
+**Target Platform:** Xilinx Artix-7 XC7A35T
 
 ---
 
-## Module Interface
+## 3. Criticality
 
-```systemverilog
-module telemetry_wrapper #(
-    parameter int CLK_HZ  = 100_000_000,
-    parameter int BAUD_HZ = 115_200
-)(
-    input  logic        clk,
-    input  logic        rst_n,
-    input  logic        ce_1hz,              // 1 Hz superframe trigger
-    input  logic        ce_1ms,              // 1 kHz arbiter tick
+**HIGH** — CS-TLM-001 to CS-TLM-008. Telemetry is the primary downlink channel for health monitoring and mission data. Loss of telemetry does not affect ADCS, but prevents ground station visibility into system state. Command uplink (CS-TLM-008) enables ground-commanded mode transitions.
 
-    // Telemetry payload inputs (pre-packed byte arrays)
-    input  logic [7:0]  adcs_tlm  [0:43],   // 44 bytes (CS-TLM-003)
-    input  logic        adcs_valid,
-    input  logic [7:0]  orbit_tlm [0:46],   // 47 bytes (CS-TLM-004)
-    input  logic        orbit_valid,
-    input  logic [7:0]  laser_tlm [0:19],   // 20 bytes (CS-TLM-005)
-    input  logic        laser_valid,
-    input  logic [7:0]  hk_tlm    [0:17],   // 18 bytes (CS-TLM-007)
-    input  logic        hk_valid,
+---
 
-    input  logic [31:0] uptime_sec,          // MET timestamp for frame header
+## 4. Key Functionality
 
-    // UART downlink
-    output logic        uart_tx,
+**Downlink Path:**
+- `tlm_arbiter` schedules 4 packet slots in a 1-second superframe: HK @ 0 ms, ADCS @ 100 ms, Orbit @ 200 ms, Laser @ 300 ms.
+- `tlm_frame_builder` assembles: `SYNC(4) | APID(2) | SEQ(2) | LEN(2) | TS(4) | PAYLOAD(N) | CRC16(2)`.
+- CRC-16/CCITT-FALSE (`crc_calc` reused) computed over APID + SEQ + LEN + TS + PAYLOAD.
+- 8N1 UART TX at configurable baud rate (default 115,200 bps) via `uart_controller`.
+- Total frame sizes: HK = 34 B, ADCS = 60 B, Orbit = 63 B, Laser = 36 B.
 
-    // UART uplink
-    input  logic        uart_rx,
+**Uplink Path:**
+- `command_decoder` parses UART RX stream; validates sync word and CRC-16; outputs `cmd_apid`, `cmd_code`, `cmd_data[0:15]`, `cmd_data_len`.
+- `command_dispatcher` routes by APID to target subsystem via AXI4-Lite master write.
+- `cmd_crc_error` and `cmd_sync_error` flags for telemetry error reporting.
 
-    // Decoded command outputs
-    output logic        cmd_valid,
-    output logic [15:0] cmd_apid,
-    output logic [7:0]  cmd_code,
-    output logic [7:0]  cmd_data [0:15],
-    output logic [4:0]  cmd_data_len,
-    output logic        cmd_crc_error,
-    output logic        cmd_sync_error,
+**Sequence Counter:**
+- 16-bit `seq_cnt` increments on each transmitted frame; exposed for gap detection.
 
-    // AXI4-Lite master (command dispatch)
-    output logic [31:0] axi_awaddr,
-    output logic        axi_awvalid,
-    input  logic        axi_awready,
-    output logic [31:0] axi_wdata,
-    output logic        axi_wvalid,
-    input  logic        axi_wready
-);
+---
+
+## 5. Inputs
+
+| Port | Direction | Width | Clock Domain | Description |
+|---|---|---|---|---|
+| `clk` | input | 1 | `sys_clk` | 100 MHz system clock |
+| `rst_n` | input | 1 | async | Active-low synchronous reset |
+| `ce_1hz` | input | 1 | `sys_clk` | 1 Hz superframe trigger from CS12 |
+| `ce_1ms` | input | 1 | `sys_clk` | 1 kHz arbiter tick from CS12 |
+| `adcs_tlm[0:43]` | input | 44 × 8 | `sys_clk` | 44-byte ADCS packet (CS-TLM-003) |
+| `adcs_valid` | input | 1 | `sys_clk` | ADCS packet data valid |
+| `orbit_tlm[0:46]` | input | 47 × 8 | `sys_clk` | 47-byte Orbit packet (CS-TLM-004) |
+| `orbit_valid` | input | 1 | `sys_clk` | Orbit packet data valid |
+| `laser_tlm[0:19]` | input | 20 × 8 | `sys_clk` | 20-byte Laser packet (CS-TLM-005) |
+| `laser_valid` | input | 1 | `sys_clk` | Laser packet data valid |
+| `hk_tlm[0:17]` | input | 18 × 8 | `sys_clk` | 18-byte HK packet (CS-TLM-007) |
+| `hk_valid` | input | 1 | `sys_clk` | HK packet data valid |
+| `uptime_sec[31:0]` | input | 32 | `sys_clk` | Mission elapsed time in seconds (frame timestamp) |
+| `uart_rx` | input | 1 | `sys_clk` | UART uplink RX (command reception) |
+| `axi_awready` | input | 1 | `sys_clk` | AXI4-Lite write address ready (from target) |
+| `axi_wready` | input | 1 | `sys_clk` | AXI4-Lite write data ready |
+| `axi_bresp[1:0]` | input | 2 | `sys_clk` | AXI4-Lite write response |
+| `axi_bvalid` | input | 1 | `sys_clk` | AXI4-Lite write response valid |
+
+---
+
+## 6. Outputs
+
+| Port | Direction | Width | Clock Domain | Description |
+|---|---|---|---|---|
+| `uart_tx` | output | 1 | `sys_clk` | UART downlink TX (8N1) |
+| `tlm_valid` | output | 1 | `sys_clk` | Pulse on each `frame_done` |
+| `tlm_busy` | output | 1 | `sys_clk` | Asserted while frame is being transmitted |
+| `cmd_valid` | output | 1 | `sys_clk` | Decoded uplink command valid |
+| `cmd_apid[15:0]` | output | 16 | `sys_clk` | Command APID |
+| `cmd_code[7:0]` | output | 8 | `sys_clk` | Command code byte |
+| `cmd_data[0:15]` | output | 16 × 8 | `sys_clk` | Command payload (up to 16 bytes) |
+| `cmd_data_len[4:0]` | output | 5 | `sys_clk` | Valid bytes in `cmd_data` |
+| `cmd_crc_error` | output | 1 | `sys_clk` | Uplink CRC mismatch |
+| `cmd_sync_error` | output | 1 | `sys_clk` | Uplink sync word not found |
+| `axi_awaddr[31:0]` | output | 32 | `sys_clk` | AXI4-Lite write address (to target subsystem) |
+| `axi_awvalid` | output | 1 | `sys_clk` | AXI4-Lite write address valid |
+| `axi_wdata[31:0]` | output | 32 | `sys_clk` | AXI4-Lite write data |
+| `axi_wvalid` | output | 1 | `sys_clk` | AXI4-Lite write data valid |
+| `axi_bready` | output | 1 | `sys_clk` | AXI4-Lite write response ready |
+
+---
+
+## 7. Architecture
+
+```
+ce_1hz (1 Hz superframe trigger)
+      │
+      ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  telemetry_wrapper                                                  │
+│                                                                    │
+│  ┌───────────────┐  slot 0–3    ┌──────────────────────────────┐  │
+│  │  tlm_arbiter  │─────────────▶│  tlm_frame_builder           │  │
+│  │  (1-sec super-│  payload mux │  SYNC(4)|APID(2)|SEQ(2)|     │  │
+│  │   frame sched)│              │  LEN(2)|TS(4)|PAYLOAD|CRC(2) │  │
+│  └───────────────┘              └────────────────┬─────────────┘  │
+│  Slots:                                           │ frame bytes    │
+│   0ms  → HK    (APID 0x0100, 18 B)               ▼                │
+│   100ms → ADCS (APID 0x0101, 44 B)   ┌─────────────────────────┐  │
+│   200ms → Orbit(APID 0x0102, 47 B)   │  uart_controller (TX)   │  │
+│   300ms → Laser(APID 0x0103, 20 B)   │  8N1, 115200 bps        │  │──▶ uart_tx
+│                                       └─────────────────────────┘  │
+│                                                                    │
+│  uart_rx ──▶ ┌──────────────────┐  cmd fields  ┌──────────────┐  │
+│              │  command_decoder  │─────────────▶│  command_    │  │
+│              │  (sync, CRC check)│              │  dispatcher  │──│──▶ AXI4-Lite
+│              └──────────────────┘              └──────────────┘  │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+**CCSDS Frame Format:**
+
+```
+Byte  0–3   : SYNC word  0x1A 0xCF 0xFC 0x1D
+Byte  4–5   : APID (MSB first)
+Byte  6–7   : SEQ counter (MSB first)
+Byte  8–9   : LEN = payload length in bytes
+Byte  10–13 : Timestamp = uptime_sec (32-bit, MSB first)
+Byte  14–13+N: PAYLOAD (N bytes)
+Last 2 bytes: CRC-16/CCITT-FALSE
+```
+
+**Reused Helper IPs (from `CubeSat/`):**
+- `uart_controller.sv` — UART TX/RX engine @ configurable baud
+- `crc_calc.sv` — CRC-16/CCITT-FALSE (polynomial 0x1021, init 0xFFFF)
+- `async_fifo.sv` — UART RX → sys_clk domain FIFO (CDC)
+
+---
+
+## 8. Data Formats
+
+| Signal | Format | Notes |
+|---|---|---|
+| `hk_tlm[0:17]` | 18 × uint8 | HK packet bytes; 18 B payload |
+| `adcs_tlm[0:43]` | 44 × uint8 | ADCS packet bytes; 44 B payload |
+| `orbit_tlm[0:46]` | 47 × uint8 | Orbit packet bytes; 47 B payload |
+| `laser_tlm[0:19]` | 20 × uint8 | Laser packet bytes; 20 B payload |
+| APID | 16-bit | HK=0x0100, ADCS=0x0101, Orbit=0x0102, Laser=0x0103 |
+| Baud period | 868 clk cycles | = CLK_HZ / BAUD_HZ = 100e6 / 115200 |
+| CRC polynomial | 0x1021 | CCITT-FALSE; init 0xFFFF |
+
+---
+
+## 9. Register Interface
+
+CS11 itself has **no AXI4-Lite slave registers** in the current implementation. CS11 acts as an **AXI4-Lite master** (`command_dispatcher`) to write to target subsystem registers after decoding uplink commands.
+
+**Parameters (synthesised):**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `CLK_HZ` | 100_000_000 | System clock frequency in Hz |
+| `BAUD_HZ` | 115_200 | UART baud rate |
+
+---
+
+## 10. File Structure
+
+```
+CubeSat/CS11_TELEMETRY/
+├── telemetry_wrapper.sv      ← Top-level wrapper; CS12 integration point
+├── tlm_arbiter.sv            ← 1-second superframe scheduler; slot arbitration
+├── tlm_frame_builder.sv      ← CCSDS frame assembly: SYNC+APID+SEQ+LEN+TS+CRC
+├── command_decoder.sv        ← UART RX parsing; sync word + CRC validation
+├── command_dispatcher.sv     ← Route commands to targets via AXI4-Lite master
+├── tb_telemetry_wrapper.sv   ← Integration testbench
+└── README.md                 ← This file
+
+CubeSat/ (shared helper IPs used by CS11):
+├── uart_controller.sv        ← UART TX/RX (8N1, configurable baud)
+├── crc_calc.sv               ← CRC-16/CCITT-FALSE calculator
+└── async_fifo.sv             ← UART RX → sys_clk CDC FIFO
 ```
 
 ---
 
-## Functionality
+## 11. Interconnections
 
-### Downlink path
-1. **Superframe** (`tlm_arbiter`) — `ce_1hz` starts a 1-second superframe. Slots at 0/100/200/300 ms select HK/ADCS/ORBIT/LASER payloads respectively via `ce_1ms` tick counter.
-2. **Frame build** (`ccsds_encoder`) — prepends 4-byte sync word, APID, sequence counter, length, and 4-byte MET timestamp. Appends CRC16/CCITT over entire frame.
-3. **UART TX** — serialises frame bytes at `CLK_HZ / BAUD_HZ` (868 cycles/bit @ 115200 bps); 8N1 framing.
-
-### Uplink path
-1. **UART RX** (`command_decoder`) — detects sync word, extracts APID, command code, data payload, and CRC16. Sets `cmd_crc_error` or `cmd_sync_error` on failures.
-2. **Dispatch** (`command_dispatcher`) — maps `cmd_apid` + `cmd_code` to AXI4-Lite register writes for runtime subsystem configuration.
-
-### Frame sizes (total bytes including header + CRC)
-| Packet | APID | Payload | Frame |
+| Signal | Direction | Connected Module | Purpose |
 |---|---|---|---|
-| HK | 0x0100 | 18 B | 34 B |
-| ADCS | 0x0101 | 44 B | 60 B |
-| Orbit | 0x0102 | 47 B | 63 B |
-| Laser | 0x0103 | 20 B | 36 B |
+| `ce_1hz` | CS11 ← CS12 | `clk_manager` (CS12) | 1 Hz superframe trigger |
+| `ce_1ms` | CS11 ← CS12 | `clk_manager` (CS12) | 1 kHz arbiter tick |
+| `hk_tlm[0:17]` | CS11 ← CS12 | `top_cubesat_mvp` (CS12) | Housekeeping telemetry |
+| `adcs_tlm[0:43]` | CS11 ← CS5/CS8 | EKF + FSM (CS5, CS8) | ADCS state telemetry |
+| `orbit_tlm[0:46]` | CS11 ← CS9 | `orbit_propagator_wrapper` (CS9) | Orbit state telemetry |
+| `laser_tlm[0:19]` | CS11 ← CS10 | `laser_fsm_wrapper` (CS10) | Laser pointing telemetry |
+| `uptime_sec` | CS11 ← CS9 | `orbit_propagator_wrapper` (CS9) | MET timestamp for frame header |
+| `uart_tx` | CS11 → Physical | FPGA I/O | Radio transceiver or debug UART |
+| `uart_rx` | CS11 ← Physical | FPGA I/O | Command uplink from ground |
+| AXI4-Lite master | CS11 → CS6 | `pd_control_wrapper` (CS6) | Gain update via command dispatcher |
 
 ---
 
-## Simulation Instructions
+## 12. Design Considerations / Optimization Scope
 
-```bash
-iverilog -g2012 -o sim_cs11 \
-  CS11_TELEMETRY/tb_telemetry_wrapper.sv \
-  CS11_TELEMETRY/telemetry_wrapper.sv \
-  CS11_TELEMETRY/tlm_arbiter.sv \
-  CS11_TELEMETRY/ccsds_encoder.sv \
-  CS11_TELEMETRY/command_decoder.sv \
-  CS11_TELEMETRY/command_dispatcher.sv \
-  CS11_TELEMETRY/tle_parser.sv \
-  uart_controller.sv crc_calc.sv async_fifo.sv mavlink_parser.sv
+**Performance:**
+- Frame transmission time @ 115,200 bps: HK=34 B → 3.0 ms; ADCS=60 B → 5.2 ms; Orbit=63 B → 5.5 ms; Laser=36 B → 3.1 ms. All fit within 100 ms inter-slot gap.
+- CRC computation: pipeline in `crc_calc`; 1 byte per clock cycle.
 
-vvp sim_cs11
-```
+**Resource:**
+- BRAM: 768 B (per plan) for frame buffer and FIFO storage.
+- DSP48E1: 0 (no arithmetic intensive operations).
 
-```tcl
-vlog -sv CS11_TELEMETRY/tb_telemetry_wrapper.sv CS11_TELEMETRY/*.sv uart_controller.sv crc_calc.sv async_fifo.sv mavlink_parser.sv
-vsim -t 1ps tb_telemetry_wrapper -do "run -all; quit"
-```
+**Optimization Opportunities:**
+1. Add configurable baud rate register (AXI4-Lite) for ground-commanded rate change.
+2. Extend `tlm_arbiter` to support variable-slot scheduling based on `*_valid` flags.
+3. Add RS-232 error detection (parity) to `uart_controller` for noisy link environments.
+4. Buffer multiple frames for burst download during contact windows.
 
----
-
-## Testbench Description
-
-| Aspect | Detail |
-|---|---|
-| Type | Directed self-checking |
-| Clock | 50 MHz |
-| CE | 1 Hz and 1 kHz internally generated |
-| Stimulus | Pre-filled payload byte arrays; loopback uart_tx → uart_rx for command round-trip |
-| Checking | CRC16 of transmitted frames; decoded command fields match injected values; `cmd_crc_error` on corrupted byte |
-| Coverage | All 4 superframe slots, CRC error injection, sync-word miss, AXI4-Lite dispatch |
+**Timing:**
+- UART bit period = CLK_HZ / BAUD_HZ clock cycles; must be stable across temperature.
+- `async_fifo` CDC: ensure correct FIFO grey-code pointer synchronisation.
 
 ---
 
-## Expected Behaviour
+## 13. Testing & Verification
 
-```
-ce_1hz              __|‾|______________________________
-ce_1ms              |‾|_|‾|_|‾|_|‾|  ...  (1 kHz)
-Slot 0 (HK @ 0ms):  uart_tx: SYNC + APID 0x0100 + 18B payload + CRC
-Slot 1 (ADCS @ 100ms): uart_tx: SYNC + APID 0x0101 + 44B payload + CRC
-tlm_valid:          |‾| briefly after each frame transmission completes
-uart_rx (uplink):   SYNC + APID + CMD_CODE + DATA + CRC → cmd_valid pulse
-cmd_crc_error:      _______ (only if RX CRC mismatch)
-```
+**Testbench:** `CubeSat/CS11_TELEMETRY/tb_telemetry_wrapper.sv`
 
----
+**Test Scenarios:**
+- Assert `hk_valid` and drive `hk_tlm[0:17]`; verify HK frame transmitted on `ce_1hz` with correct APID 0x0100.
+- Verify SYNC word (0x1A 0xCF 0xFC 0x1D) appears at start of each frame on `uart_tx`.
+- Drive `adcs_tlm`, `orbit_tlm`, `laser_tlm` with known byte sequences; verify CRC-16 matches golden reference.
+- Increment `uptime_sec`; verify timestamp field in frame header updates.
+- Inject valid uplink command frame on `uart_rx`; verify `cmd_valid` asserts and `cmd_apid/code/data` are correct.
+- Inject malformed uplink frame; verify `cmd_crc_error` or `cmd_sync_error` asserts.
+- Verify `seq_cnt` increments by 1 per transmitted frame.
+- Verify `tlm_busy` is asserted during frame transmission and `tlm_valid` pulses on `frame_done`.
 
-## Limitations
+**Simulation Notes:**
+- Compile with `iverilog -g2012` including `uart_controller.sv`, `crc_calc.sv`, `async_fifo.sv`.
+- Timescale: 1 ns / 1 ps.
+- Include UART RX model to inject command frames.
 
-- Superframe schedule is fixed-slot; no adaptive priority for burst fault telemetry.
-- Command authentication (HMAC, sequence number replay check) not implemented in MVP.
-- No ARQ / retransmission for packet loss on the downlink.
-- UART baud is a compile-time parameter; runtime baud change not supported.
-
----
-
-## Verification Status
-
-- [x] Compiles without warnings (`iverilog -g2012`)
-- [x] All 4 superframe slots transmit in correct time order
-- [x] CRC16 of each frame verified by testbench
-- [x] `cmd_valid` asserts on correctly framed uplink command
-- [x] `cmd_crc_error` asserts on corrupted command byte
-- [x] AXI4-Lite dispatch generates correct address/data
-- [x] Integrated in `top_cubesat_mvp` (CS12)
-- [ ] Adaptive schedule / QoS for burst faults
-- [ ] Command security (replay protection, HMAC)
+**Requirements Coverage:**
+- CS-TLM-001: CCSDS frame format SYNC+APID+SEQ+LEN+TS+PAYLOAD+CRC16.
+- CS-TLM-003/004/005/007: ADCS(44 B), Orbit(47 B), Laser(20 B), HK(18 B) packet formats.
+- CS-TLM-006: 1 Hz superframe with 100 ms inter-slot spacing.
+- CS-TLM-008: UART RX command reception with CRC validation and AXI4-Lite routing.
+- Architecture: `Architecture/SUBSYSTEM_MODULE_MAPPING.md`
