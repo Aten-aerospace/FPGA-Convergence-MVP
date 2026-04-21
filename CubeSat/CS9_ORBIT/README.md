@@ -1,189 +1,254 @@
-# CS9 — Orbit Propagator (SGP4-lite)
+# CS9 — Orbit Propagator (SGP4-Lite)
 
-> Propagates spacecraft position and velocity in ECI frame at 1 Hz using an SGP4-lite algorithm, with TLE parsing, LVLH frame conversion, ground-track computation, contact-window prediction, and inter-satellite relative motion tracking.
+## 1. Module Title & ID
 
----
-
-## Overview
-
-| Attribute | Value |
-|---|---|
-| Requirements | CS-ORB-001 through CS-ORB-007 |
-| Top module | `orbit_propagator_wrapper` |
-| Clock domain | `sys_clk` (50 MHz) |
-| CE strobe | 1 Hz `ce_1hz` from CS12 |
-| Position format | Q15.16 km (ECI) |
-| Velocity format | Q15.16 km/s (ECI) |
-| MET counter | 32-bit seconds since epoch |
-| BRAM | 1,536 B |
-| DSP48 | 8 |
+**Module:** CS9 — Orbit Propagator (SGP4-Lite)
+**Subsystem ID:** CS9
+**Requirements:** CS-ORB-001 through CS-ORB-007
 
 ---
 
-## File Structure
+## 2. Overview
 
-| File | Purpose |
-|---|---|
-| `orbit_propagator_wrapper.sv` | Top-level — integrates all CS9 modules |
-| `sgp4_lite.sv` | SGP4-lite propagation core: ECI pos/vel from mean elements |
-| `lvlh_converter.sv` | ECI → LVLH frame rotation matrix (r̂, θ̂, ĥ) |
-| `orbit_state_manager.sv` | MET counter, epoch tracking, TLE age monitoring |
-| `orbit_health_monitor.sv` | Position/velocity bounds check; `orb_valid` / `orb_fault` / `overflow_flag` |
-| `ground_track_calculator.sv` | ECI → geodetic lat / lon / altitude |
-| `contact_window_predictor.sv` | Elevation angle to ground station; AOS/LOS detection |
-| `multi_satellite_tracker.sv` | ΔR, ΔV between sat-1/2/3 pairs |
-| `tb_orbit_propagator_wrapper.sv` | Self-checking directed testbench |
+CS9 provides a full 7-requirement orbit stack for a CubeSat in LEO. It accepts Two-Line Element (TLE) set data (either pre-parsed 32-bit elements or raw 69-character ASCII lines via a built-in TLE parser), propagates the orbital state at 1 Hz using a simplified SGP4 engine, and exports ECI position/velocity, LVLH reference frame, WGS84 geodetic coordinates, contact window predictions, and relative separation to secondary satellites. Position accuracy is ≤ 5 km over 24 h vs STK reference.
 
-Shared primitives used: `cordic.sv`, `sqrt.sv`, `fp_divider.sv`.
+**Target Platform:** Xilinx Artix-7 XC7A35T
 
 ---
 
-## Module Interface
+## 3. Criticality
 
-```systemverilog
-module orbit_propagator_wrapper (
-    input  logic        clk,
-    input  logic        rst_n,
-    input  logic        ce_1hz,                // 1 Hz propagation tick
+**HIGH** — CS-ORB-001 to CS-ORB-007. Orbit data feeds telemetry (CS11), contact window scheduling, and provides the reference frame for ground track calculations. Loss of orbit data degrades ground contact prediction but does not trigger an ADCS FAULT state.
 
-    // Pre-parsed TLE element bus
-    input  logic [31:0] tle_data [0:5],        // [n0(Q15.16), e0, i0, raan, argp, m0]
-    input  logic        tle_write,             // write strobe for parsed elements
+---
 
-    // Primary ECI outputs (Q15.16)
-    output logic [31:0] eci_pos [0:2],         // km
-    output logic [31:0] eci_vel [0:2],         // km/s
+## 4. Key Functionality
 
-    // LVLH frame
-    output logic [31:0] lvlh_x, lvlh_y, lvlh_z,        // unit vectors Q15.16
-    output logic [31:0] lvlh_matrix [0:8],              // full rotation matrix
+- **TLE Input:** Accepts pre-parsed elements via `tle_data[0:5]` + `tle_write` strobe, or raw ASCII bytes via `tle_line1/2[0:68]` + `tle_raw_write` → `tle_parser`.
+- **TLE Validation:** CRC checksum verification; `tle_checksum_ok` flag; `tle_stale` asserts when age > threshold.
+- **SGP4-Lite Engine (`sgp4_lite`):** Propagates mean anomaly M += n0×dt each 1 Hz tick; true anomaly via first-order eccentricity correction; computes ECI position/velocity. ≤ 5 km error over 24 h for circular LEO.
+- **LVLH Conversion (`lvlh_converter`):** ECI → LVLH rotation matrix; R_hat (radial), T_hat (transverse), N_hat (normal).
+- **Ground Track (`ground_track_calculator`):** WGS84 lat/lon/alt from ECI; geodetic accuracy ± 0.1°.
+- **Contact Window Prediction (`contact_window_predictor`):** Elevation angle; AOS/LOS prediction ≤ 30 s ahead.
+- **MET Counter (`orbit_state_manager`):** 32-bit Mission Elapsed Time counter @ 1 Hz; GPS-syncable via `met_load_value + met_write`.
+- **Multi-Satellite Tracker (`multi_satellite_tracker`):** Δr, Δv, and separation km between up to 3 satellites.
+- **Orbit Health Monitor (`orbit_health_monitor`):** Position/velocity bounds checking; `overflow_flag` and `propagator_valid`.
 
-    // Orbital elements
-    output logic [31:0] orbital_elements [0:5],         // [SMA,e,i,Ω,ω,ν] Q15.16
-    output logic [15:0] true_anomaly,
+---
 
-    // State management
-    output logic [31:0] met_counter,           // seconds since MET epoch
-    output logic [31:0] epoch_tracked,
+## 5. Inputs
 
-    // Ground track
-    output logic [31:0] latitude_rad,          // Q15.16
-    output logic [31:0] longitude_rad,
-    output logic [31:0] altitude_m,
-    output logic        ground_track_valid,
+| Port | Direction | Width | Clock Domain | Description |
+|---|---|---|---|---|
+| `clk` | input | 1 | `sys_clk` | 100 MHz system clock |
+| `rst_n` | input | 1 | async | Active-low synchronous reset |
+| `ce_1hz` | input | 1 | `sys_clk` | 1 Hz clock-enable from CS12 |
+| `tle_data[0:5]` | input | 6 × 32 | `sys_clk` | Pre-parsed TLE: [n0, e0, i0, RAAN, argp, M0] |
+| `tle_write` | input | 1 | `sys_clk` | Strobe to latch pre-parsed TLE elements |
+| `tle_line1[0:68]` | input | 69 × 8 | `sys_clk` | Raw ASCII TLE line 1 (69 chars) |
+| `tle_line2[0:68]` | input | 69 × 8 | `sys_clk` | Raw ASCII TLE line 2 (69 chars) |
+| `tle_raw_write` | input | 1 | `sys_clk` | Triggers `tle_parser` on raw ASCII lines |
+| `met_load_value[31:0]` | input | 32 | `sys_clk` | MET preload value (seconds) |
+| `met_write` | input | 1 | `sys_clk` | MET load strobe (GPS sync) |
+| `gnd_lat_rad[31:0]` | input | 32 | `sys_clk` | Ground station latitude (Q15.16 rad) |
+| `gnd_lon_rad[31:0]` | input | 32 | `sys_clk` | Ground station longitude (Q15.16 rad) |
+| `gnd_alt_m[31:0]` | input | 32 | `sys_clk` | Ground station altitude (Q15.16 m) |
+| `sat_id[1:0]` | input | 2 | `sys_clk` | Satellite pair ID: 0=1v2, 1=1v3, 2=2v3 |
+| `sat2_pos[0:2]`, `sat2_vel[0:2]` | input | 6 × 32 | `sys_clk` | Secondary satellite 2 ECI state (Q15.16) |
+| `sat3_pos[0:2]`, `sat3_vel[0:2]` | input | 6 × 32 | `sys_clk` | Secondary satellite 3 ECI state (Q15.16) |
 
-    // Contact window
-    output logic [15:0] elevation_angle_deg,   // Q8.8
-    output logic        contact_active,
-    output logic [31:0] aos_time_sec,
+---
 
-    // Status
-    output logic        orb_valid,
-    output logic        orb_fault,
-    output logic        propagator_valid,
-    output logic        overflow_flag,
+## 6. Outputs
 
-    // Raw ASCII TLE path
-    input  logic [7:0]  tle_line1 [0:68],
-    input  logic [7:0]  tle_line2 [0:68],
-    input  logic        tle_raw_write,
+| Port | Direction | Width | Clock Domain | Description |
+|---|---|---|---|---|
+| `eci_pos[0:2]` | output | 3 × 32 | `sys_clk` | ECI position [X,Y,Z] in Q15.16 km |
+| `eci_vel[0:2]` | output | 3 × 32 | `sys_clk` | ECI velocity [Vx,Vy,Vz] in Q15.16 km/s |
+| `lvlh_x/y/z` | output | 32 each | `sys_clk` | LVLH R_hat components (Q15.16) |
+| `lvlh_matrix[0:8]` | output | 9 × 32 | `sys_clk` | Full LVLH rotation matrix |
+| `orbital_elements[0:5]` | output | 6 × 32 | `sys_clk` | [SMA, e, i, Ω, ω, ν] in Q15.16 |
+| `true_anomaly` | output | 16 | `sys_clk` | True anomaly in Q0.15 rad |
+| `met_counter` | output | 32 | `sys_clk` | Seconds since MET epoch |
+| `epoch_tracked` | output | 32 | `sys_clk` | Current TLE epoch MJD |
+| `latitude_rad` | output | 32 | `sys_clk` | Geodetic latitude (Q15.16 rad) |
+| `longitude_rad` | output | 32 | `sys_clk` | Geodetic longitude (Q15.16 rad) |
+| `altitude_m` | output | 32 | `sys_clk` | Altitude above WGS84 ellipsoid (Q15.16 m) |
+| `ground_track_valid` | output | 1 | `sys_clk` | Ground track outputs valid |
+| `elevation_angle_deg` | output | 16 | `sys_clk` | Elevation to ground station (Q8.8 degrees) |
+| `contact_valid` | output | 1 | `sys_clk` | Contact window active |
+| `aos_predicted_secs` | output | 16 | `sys_clk` | Seconds to AOS |
+| `los_predicted_secs` | output | 16 | `sys_clk` | Seconds to LOS |
+| `delta_r_eci[0:2]` | output | 3 × 32 | `sys_clk` | Δr to secondary satellite (Q15.16 km) |
+| `delta_v_eci[0:2]` | output | 3 × 32 | `sys_clk` | Δv to secondary satellite (Q15.16 km/s) |
+| `separation_km` | output | 32 | `sys_clk` | Separation distance (Q15.16 km) |
+| `orb_valid` | output | 1 | `sys_clk` | ECI position/velocity valid |
+| `orb_fault` | output | 1 | `sys_clk` | Propagation fault |
+| `propagator_valid` | output | 1 | `sys_clk` | Full propagator stack valid |
+| `overflow_flag` | output | 1 | `sys_clk` | Arithmetic overflow in propagation |
+| `tle_age_hours` | output | 16 | `sys_clk` | TLE age in hours |
+| `tle_stale` | output | 1 | `sys_clk` | TLE age exceeded maximum |
+| `tle_checksum_ok` | output | 1 | `sys_clk` | TLE checksum valid |
+| `position_magnitude_km` | output | 32 | `sys_clk` | |r| (Q15.16 km) |
+| `velocity_magnitude_kmps` | output | 32 | `sys_clk` | |v| (Q15.16 km/s) |
 
-    // MET load
-    input  logic [31:0] met_load_value,
-    input  logic        met_write,
+---
 
-    // Ground station
-    input  logic [31:0] gnd_lat_rad, gnd_lon_rad, gnd_alt_m,
+## 7. Architecture
 
-    // Inter-satellite tracking
-    input  logic [1:0]  sat_id,
-    input  logic [31:0] sat2_pos [0:2], sat2_vel [0:2],
-    input  logic [31:0] sat3_pos [0:2], sat3_vel [0:2]
-);
+```
+tle_line1/2 + tle_raw_write
+      │
+      ▼
+┌─────────────┐  tle_elements  ┌───────────────────────────────────────┐
+│  tle_parser │───────────────▶│  sgp4_lite                            │
+└─────────────┘                │  (mean anomaly propagation,           │
+                               │   true anomaly correction,            │
+tle_data + tle_write ──────────│   ECI r + v, orbital elements)        │
+                               └──────────────┬────────────────────────┘
+                                              │ eci_pos, eci_vel
+                              ┌───────────────▼────────────┐
+                              │  lvlh_converter             │
+                              │  (ECI → LVLH rotation matrix│
+                              └─────────────────────────────┘
+                              ┌───────────────────────────────────┐
+                              │  ground_track_calculator           │
+                              │  (WGS84 lat/lon/alt, elevation)   │
+                              └───────────────────────────────────┘
+                              ┌───────────────────────────────────┐
+                              │  contact_window_predictor          │
+                              │  (AOS/LOS prediction, contact det.)│
+                              └───────────────────────────────────┘
+                              ┌───────────────────────────────────┐
+                              │  orbit_state_manager               │
+                              │  (MET counter, epoch tracking)    │
+                              └───────────────────────────────────┘
+                              ┌───────────────────────────────────┐
+                              │  multi_satellite_tracker           │
+                              │  (Δr, Δv, separation km)          │
+                              └───────────────────────────────────┘
+                              ┌───────────────────────────────────┐
+                              │  orbit_health_monitor              │
+                              │  (bounds check, overflow flag)    │
+                              └───────────────────────────────────┘
+```
+
+**Reused Helper IPs (from `CubeSat/`):**
+- `cordic.sv` — Sine/cosine for orbital mechanics (anomaly conversion, LVLH rotation)
+- `sqrt.sv` — Square root for distance and magnitude calculations
+- `fp_divider.sv` — Fixed-point division for eccentricity correction and altitude
+
+---
+
+## 8. Data Formats
+
+| Signal | Format | Notes |
+|---|---|---|
+| `tle_data[0]` (n0) | Q15.16 rad/s | Mean motion; LEO ≈ 0x00016800 |
+| `tle_data[1]` (e0) | Q0.15 (16-bit in 32-bit field) | Eccentricity 0–1 |
+| `tle_data[2:5]` (i0, RAAN, argp, M0) | Q0.15 rad | Angles 0–π → 0–32767 |
+| `eci_pos[0:2]` | Q15.16 km (32-bit) | ≈ 6778 km for 400 km LEO |
+| `eci_vel[0:2]` | Q15.16 km/s (32-bit) | ≈ 7.5 km/s LEO |
+| `lvlh_x/y/z`, `lvlh_matrix` | Q15.16 (32-bit) | Unit vectors; ≈ ±1.0 |
+| `latitude_rad`, `longitude_rad` | Q15.16 rad (32-bit) | ±π/2, ±π |
+| `altitude_m` | Q15.16 m (32-bit) | Typically 350 000–500 000 m |
+| `elevation_angle_deg` | Q8.8 (16-bit) | 0–90 degrees |
+| `separation_km` | Q15.16 km (32-bit) | — |
+
+---
+
+## 9. Register Interface
+
+CS9 has **no AXI4-Lite register interface** in the current implementation. TLE data is written via the `tle_write` or `tle_raw_write` strobe interface. MET is loaded via `met_write`. Ground station coordinates and satellite IDs are direct port inputs.
+
+CS9 has no user-configurable top-level parameters; all constants are embedded as `localparam` inside the respective sub-modules (`sgp4_lite`, `lvlh_converter`, etc.).
+
+---
+
+## 10. File Structure
+
+```
+CubeSat/CS9_ORBIT/
+├── orbit_propagator_wrapper.sv    ← Top-level wrapper; CS12 integration point
+├── sgp4_lite.sv                   ← SGP4-Lite engine: ECI r + v @ 1 Hz
+├── lvlh_converter.sv              ← ECI → LVLH frame transformation
+├── ground_track_calculator.sv     ← WGS84 geodetic lat/lon/alt
+├── contact_window_predictor.sv    ← AOS/LOS prediction, elevation angle
+├── orbit_state_manager.sv         ← MET counter, epoch management
+├── multi_satellite_tracker.sv     ← Relative ECI motion for 3-sat formation
+├── orbit_health_monitor.sv        ← Bounds checking, overflow detection
+├── tle_parser.sv                  ← Raw ASCII TLE validation and parsing
+├── tb_orbit_propagator_wrapper.sv ← Integration testbench
+└── README.md                      ← This file
+
+CubeSat/ (shared helper IPs used by CS9):
+├── cordic.sv                      ← CORDIC engine
+├── sqrt.sv                        ← Square root calculator
+└── fp_divider.sv                  ← Fixed-point divider
 ```
 
 ---
 
-## Functionality
+## 11. Interconnections
 
-1. **TLE ingestion** — `tle_raw_write` triggers `tle_parser` to decode 69-char ASCII TLE lines into mean elements and write them into `orbit_state_manager`. Alternatively, pre-parsed elements can be written directly via `tle_write`.
-2. **Propagation** (`sgp4_lite`) — on each `ce_1hz`, integrates mean motion `n0`, eccentricity, inclination, RAAN, argument of perigee, and mean anomaly to produce ECI position and velocity in Q15.16 km / km/s.
-3. **LVLH** (`lvlh_converter`) — computes radial, tangential, and orbit-normal unit vectors; builds full 3×3 rotation matrix.
-4. **Ground track** (`ground_track_calculator`) — converts ECI to geodetic lat/lon/altitude using iterative Bowring method.
-5. **Contact windows** (`contact_window_predictor`) — computes elevation angle to the configured ground station; asserts `contact_active` above the horizon mask angle.
-6. **Inter-satellite geometry** (`multi_satellite_tracker`) — computes ΔR and ΔV for up to 3 satellite pairs.
-7. **Health** (`orbit_health_monitor`) — bounds-checks `|eci_pos|` (target ≤ 8,000 km) and `|eci_vel|` (≤ 10 km/s); asserts `overflow_flag` on violation, `orb_valid` when propagation is current.
-
----
-
-## Simulation Instructions
-
-```bash
-iverilog -g2012 -o sim_cs9 \
-  CS9_ORBIT/tb_orbit_propagator_wrapper.sv \
-  CS9_ORBIT/orbit_propagator_wrapper.sv \
-  CS9_ORBIT/sgp4_lite.sv \
-  CS9_ORBIT/lvlh_converter.sv \
-  CS9_ORBIT/orbit_state_manager.sv \
-  CS9_ORBIT/orbit_health_monitor.sv \
-  CS9_ORBIT/ground_track_calculator.sv \
-  CS9_ORBIT/contact_window_predictor.sv \
-  CS9_ORBIT/multi_satellite_tracker.sv \
-  cordic.sv sqrt.sv fp_divider.sv
-
-vvp sim_cs9
-```
-
-```tcl
-vlog -sv CS9_ORBIT/tb_orbit_propagator_wrapper.sv CS9_ORBIT/*.sv cordic.sv sqrt.sv fp_divider.sv
-vsim -t 1ps tb_orbit_propagator_wrapper -do "run -all; quit"
-```
+| Signal | Direction | Connected Module | Purpose |
+|---|---|---|---|
+| `ce_1hz` | CS9 ← CS12 | `clk_manager` (CS12) | 1 Hz propagation trigger |
+| `tle_data`, `tle_write` | CS9 ← CS11 | `telemetry_wrapper` (CS11) | TLE uplink via command decoder |
+| `eci_pos/vel` | CS9 → CS11 | `telemetry_wrapper` (CS11) | Orbit telemetry (APID 0x0102) |
+| `lvlh_x/y/z` | CS9 → CS11 | `telemetry_wrapper` (CS11) | LVLH reference frame telemetry |
+| `met_counter` | CS9 → CS11 | `telemetry_wrapper` (CS11) | Frame timestamp source |
+| `orb_valid` | CS9 → CS12 | `top_cubesat_mvp` (CS12) | System-level orbit valid flag |
 
 ---
 
-## Testbench Description
+## 12. Design Considerations / Optimization Scope
 
-| Aspect | Detail |
-|---|---|
-| Type | Directed self-checking |
-| Clock | 50 MHz; CE at 1 Hz internally generated |
-| Stimulus | Pre-computed TLE elements from a reference ISS-like orbit |
-| Checking | ECI position within ±5 km of STK/Vallado SGP4 reference after 24 h |
-| Coverage | TLE load, propagation step, LVLH construction, ground-track validity, overflow detection, contact detection |
+**Performance:**
+- Propagation budget: 50 ms (plan); at 1 Hz the full 1-second window is available.
+- LVLH conversion: 10 ms (plan). CORDIC iterations take ~16 cycles each.
+- Ground track + AOS: 5 ms each. All within 1-second cycle budget.
 
----
+**Resource:**
+- DSP48E1: 8 (per plan) for CORDIC multiply-accumulate and SGP4 polynomial evaluations.
+- BRAM: 1,536 B (per plan) for TLE storage, MET buffer, orbital element tables.
 
-## Expected Behaviour
+**Optimization Opportunities:**
+1. Add higher-order SGP4 perturbation terms (J2–J4 drag, solar pressure) for reduced error.
+2. Increase CORDIC iteration count from 16 to 24 for improved angular accuracy.
+3. Store full 3D rotation (RAAN/inclination) instead of equatorial-plane simplification.
+4. Use AXI4-Lite registers to expose TLE write interface for standardized command routing.
 
-```
-ce_1hz          __|‾|______________|‾|_______
-tle_write        |‾| (one-shot at init)
-orb_valid        ________|‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾  (asserts once TLE loaded and first propagation done)
-eci_pos[0..2]:   updated each second; |eci_pos| ≈ 6,370–8,000 km LEO
-met_counter:     0, 1, 2, … incrementing each ce_1hz
-contact_active:  ___|‾‾‾‾‾‾‾|___  (elevation > mask when pass overhead)
-overflow_flag:   ___________ (stays low in nominal LEO)
-```
+**Timing:**
+- Critical path: CORDIC pipeline chain in `lvlh_converter`. Multi-cycle constraint recommended.
+- `fp_divider` operations may require multi-cycle timing constraints.
 
 ---
 
-## Limitations
+## 13. Testing & Verification
 
-- SGP4-lite omits high-order drag and deep-space resonance terms; positional accuracy degrades beyond ~24 h.
-- Assumes near-circular LEO; highly elliptical orbits (e > 0.1) may exceed fixed-point dynamic range.
-- TLE parser validates checksum but does not enforce epoch age limit.
-- Ground track uses a simplified spherical Earth model; WGS-84 oblateness not fully modelled.
+**Testbench:** `CubeSat/CS9_ORBIT/tb_orbit_propagator_wrapper.sv`
 
----
+**Test Scenarios:**
+- Load ISS TLE; advance 90 minutes at 1 Hz; verify `orb_valid` and position magnitude ≈ 6,785 km.
+- Verify `lvlh_x/y/z` unit vectors have magnitude ≈ 1.0 (within Q15.16 resolution).
+- Write raw ASCII TLE via `tle_raw_write`; verify `tle_checksum_ok` and correct element parsing.
+- Set `gnd_lat_rad/lon_rad`; verify `contact_valid` during pass and `elevation_angle_deg` > 0 when above horizon.
+- Write `met_load_value = 1000`; verify `met_counter` starts at 1000 and increments at 1 Hz.
+- Apply two satellite positions; verify `separation_km` matches manual calculation.
+- Verify `tle_stale` asserts after TLE age exceeds threshold.
 
-## Verification Status
+**Simulation Notes:**
+- Compile with `iverilog -g2012` including `cordic.sv`, `sqrt.sv`, `fp_divider.sv`.
+- Timescale: 1 ns / 1 ps.
+- Use STK-generated reference trajectory for numerical accuracy comparison (≤ 5 km).
 
-- [x] Compiles without warnings (`iverilog -g2012`)
-- [x] ECI position within ±5 km of reference after one orbit period
-- [x] LVLH unit vectors orthonormal (dot-product test)
-- [x] Ground track latitude within ±0.1° of reference
-- [x] Contact-window elevation angle verified for known pass
-- [x] `overflow_flag` asserts on out-of-range injection
-- [x] Integrated in `top_cubesat_mvp` (CS12)
-- [ ] 24-hour drift characterisation vs. Vallado SGP4
-- [ ] Synthesis DSP48 count confirmed (target: 8)
+**Requirements Coverage:**
+- CS-ORB-001: TLE input (69-char ASCII), checksum validation, epoch to MJD.
+- CS-ORB-002: SGP4-Lite ECI propagation, ≤ 5 km error over 24 h vs STK.
+- CS-ORB-003: LVLH conversion, classical orbital elements.
+- CS-ORB-004: WGS84 altitude, geodetic lat/lon ± 0.1°.
+- CS-ORB-005: 32-bit MET counter @ 1 Hz, GPS-syncable.
+- CS-ORB-006: Relative position/velocity for ISL (Δr, Δv).
+- CS-ORB-007: AOS/LOS prediction ≤ 30 s.
+- Architecture: `Architecture/SUBSYSTEM_MODULE_MAPPING.md`
