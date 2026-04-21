@@ -1,149 +1,206 @@
 # CS4 — Quaternion Propagator
 
-> Propagates the spacecraft attitude quaternion one time-step using gyroscope angular rates via the Hamilton product `q(k+1) = normalise(q(k) ⊗ dq)` in Q15 fixed-point at 100 Hz.
+## 1. Module Title & ID
+
+**Module:** CS4 — Quaternion Propagator
+**Subsystem ID:** CS4
+**Requirement:** CS-ADCS-004
 
 ---
 
-## Overview
+## 2. Overview
 
-| Attribute | Value |
-|---|---|
-| Requirement | CS-ADCS-004 |
-| Top module | `quat_propagator_wrapper` |
-| Clock domain | `sys_clk` (50 MHz) |
-| CE strobe | 100 Hz `ce_100hz` from CS12 |
-| Algorithm | Small-angle quaternion kinematics: dq = [1, ω·dt/2] |
-| Fixed-point | Q15 — `DT_HALF = 164` (= 0.005 × 32768, dt = 10 ms) |
-| Pipeline latency | ~7 cycles (multiply) + 2 cycles (norm check) = ~9 total |
-| BRAM | 96 B |
-| DSP48 | 3 |
+CS4 propagates the spacecraft attitude quaternion forward one time step (dt = 0.01 s at 100 Hz) using the angular velocity measurement from the IMU (CS1). It applies the small-angle quaternion kinematic equation in Q15 fixed-point arithmetic: `q(k+1) = normalize(q(k) ⊗ dq)`, where `dq = [1, ω·dt/2]`. The pipeline is 3-stage (multiply) + 3-stage (normalize), delivering the result within ≈ 7 clock cycles. A post-normalization health checker verifies that the output quaternion remains a unit quaternion to within tolerance.
+
+**Target Platform:** Xilinx Artix-7 XC7A35T
 
 ---
 
-## File Structure
+## 3. Criticality
 
-| File | Purpose |
-|---|---|
-| `quat_propagator_wrapper.sv` | Top-level — dq computation, pipeline staging, norm health check |
-| `quat_multiply.sv` | 3-cycle pipelined Hamilton product |
-| `quat_normalize.sv` | 3-cycle Newton-Raphson normalisation |
-| `norm_checker.sv` | 2-cycle post-normalisation health check (`|‖q‖²−1|`) |
-| `quaternion_math.sv` | Shared arithmetic helpers |
-| `quat_propagator.sv` | Lower-level propagation step |
-| `tb_quat_propagator_wrapper.sv` | Self-checking directed testbench |
-
-Shared primitives used: `cordic.sv`, `sqrt.sv`, `fp_divider.sv`.
+**CRITICAL** — CS-ADCS-004. The quaternion propagator provides the between-update attitude prediction required by the EKF (CS5) and is the primary attitude state when CS5 is initializing. Norm drift > 0.001 over 60 s indicates a failure condition.
 
 ---
 
-## Module Interface
+## 4. Key Functionality
 
-```systemverilog
-module quat_propagator_wrapper (
-    input  logic        clk,
-    input  logic        rst_n,
-    input  logic        ce_100hz,                     // 100 Hz clock enable
+- Accepts current quaternion `q_in[0:3]` (Q15) and angular velocity `omega[0:2]` (Q15 rad/s) every `ce_100hz`.
+- Computes delta quaternion `dq = [32767, ω_x·DT_HALF, ω_y·DT_HALF, ω_z·DT_HALF]` in Q15 (DT_HALF = 164 ≈ 0.005 × 32768).
+- 3-cycle pipelined Hamilton product `q(k) ⊗ dq` via `quat_multiply`.
+- 3-cycle Newton-Raphson normalization via `quat_normalize`; sets `norm_error` if pre-norm magnitude deviates > 5 %.
+- Post-normalization `norm_checker` verifies output norm within 2 additional cycles; outputs `norm_ok` and `norm_val`.
+- Total pipeline latency: ~7 cycles (multiply + normalize); ~9 cycles to `norm_ok_valid`.
+- Identity quaternion `[32767, 0, 0, 0]` on reset.
+- `quat_ready` is an alias of `q_valid_out` for downstream handshaking.
 
-    input  logic signed [15:0] q_in  [0:3],           // current quaternion Q15 [w,x,y,z]
-    input  logic               q_valid_in,
+---
 
-    input  logic signed [15:0] omega [0:2],            // angular rate Q15 rad/s [x,y,z]
+## 5. Inputs
 
-    output logic signed [15:0] q_out       [0:3],     // propagated quaternion Q15
-    output logic               q_valid_out,            // strobe: q_out updated
-    output logic               norm_error,             // pre-norm magnitude fault
-    output logic        [15:0] q_norm,                 // squared-norm Q15 (≈32767 = unit)
-    output logic               q_norm_valid,
+| Port | Direction | Width | Clock Domain | Description |
+|---|---|---|---|---|
+| `clk` | input | 1 | `sys_clk` | 100 MHz system clock |
+| `rst_n` | input | 1 | async | Active-low synchronous reset |
+| `ce_100hz` | input | 1 | `sys_clk` | 100 Hz clock-enable from CS12 |
+| `q_in[0:3]` | input | 4 × 16 | `sys_clk` | Current attitude quaternion [w,x,y,z] in Q15 |
+| `q_valid_in` | input | 1 | `sys_clk` | `q_in` is valid |
+| `omega[0:2]` | input | 3 × 16 | `sys_clk` | Angular velocity [x,y,z] in Q15 rad/s (from CS1) |
 
-    output logic               norm_ok,                // post-norm health (2 cycles later)
-    output logic        [15:0] norm_val,               // |‖q‖²−1| deviation Q15
-    output logic               norm_ok_valid,
-    output logic               quat_ready              // alias of q_valid_out
-);
+---
+
+## 6. Outputs
+
+| Port | Direction | Width | Clock Domain | Description |
+|---|---|---|---|---|
+| `q_out[0:3]` | output | 4 × 16 | `sys_clk` | Propagated + normalised quaternion [w,x,y,z] in Q15 |
+| `q_valid_out` | output | 1 | `sys_clk` | One-cycle strobe — `q_out` updated |
+| `quat_ready` | output | 1 | `sys_clk` | Alias of `q_valid_out` (propagation complete) |
+| `norm_error` | output | 1 | `sys_clk` | Pre-norm magnitude deviates > 5 % from 1.0 |
+| `q_norm` | output | 16 | `sys_clk` | Squared-norm in Q15 (≈ 32767 for unit quaternion) |
+| `q_norm_valid` | output | 1 | `sys_clk` | Strobe aligned with `q_valid_out` |
+| `norm_ok` | output | 1 | `sys_clk` | Post-norm output is within tolerance |
+| `norm_val` | output | 16 | `sys_clk` | `|‖q‖²−1|` deviation in Q15 |
+| `norm_ok_valid` | output | 1 | `sys_clk` | Strobe: `norm_ok` / `norm_val` are valid (+2 cycles) |
+
+---
+
+## 7. Architecture
+
+```
+ce_100hz && q_valid_in
+      │
+      ▼ (register inputs)
+  q_in_r[0:3], dq_r[0:3]
+      │
+      ▼
+┌────────────────────┐  q_mul_out[0:3]   ┌────────────────────┐  q_out[0:3]
+│   quat_multiply    │──────────────────▶│   quat_normalize   │──────────────▶
+│  (3-cycle pipeline,│  mul_valid_out     │  (3-cycle pipeline,│  q_valid_out
+│   Hamilton product)│                   │   Newton-Raphson)  │  norm_error
+└────────────────────┘                   └────────────────────┘  q_norm
+                                                    │
+                                                    ▼ (+2 cycles)
+                                         ┌──────────────────────┐
+                                         │    norm_checker       │
+                                         │  (post-norm health   │
+                                         │   check on q_out)    │
+                                         └──────────────────────┘
+                                              norm_ok, norm_val
+                                              norm_ok_valid
+```
+
+**Reused Helper IPs (from `CubeSat/`):**
+- `cordic.sv` — CORDIC engine (used for quaternion magnitude in normalization)
+- `sqrt.sv` — Square root (Newton-Raphson normalization support)
+- `fp_divider.sv` — Fixed-point divider (normalization step)
+
+**Sub-modules (CS4-specific):**
+- `quat_multiply.sv` — 3-cycle pipelined Hamilton product
+- `quat_normalize.sv` — 3-cycle Newton-Raphson normalization
+- `norm_checker.sv` — 2-cycle post-normalization health check
+- `quaternion_math.sv` — Utility: quaternion conjugate and algebra helpers
+
+---
+
+## 8. Data Formats
+
+| Signal | Format | Notes |
+|---|---|---|
+| `q_in[0:3]`, `q_out[0:3]` | Q15 signed (16-bit) | 1.0 = 32767 (0x7FFF); unit quaternion |
+| `omega[0:2]` | Q15 signed (16-bit) | rad/s; 1.0 = 32767 |
+| `dq` (internal) | Q15 signed (16-bit) | `dq[0] = 32767`; `dq[1:3] = omega × DT_HALF >> 15` |
+| `q_norm` | Q15 unsigned (16-bit) | Squared norm; ≈ 32767 for unit quaternion |
+| `norm_val` | Q15 unsigned (16-bit) | `|‖q‖²−1|`; 0 = perfect unit quaternion |
+| DT_HALF constant | Q15 integer = 164 | `round(0.005 × 32768)` for 100 Hz rate |
+
+---
+
+## 9. Register Interface
+
+CS4 has **no AXI4-Lite register interface**. The `DT_HALF` constant is a compile-time `localparam`. If the update rate changes (e.g., 500 Hz), update `DT_HALF = round(0.001 × 32768) = 33` accordingly.
+
+**Parameters (synthesised):**
+
+| Parameter | Default | Description |
+|---|---|---|
+| None (wrapper) | — | Parameters are embedded as `localparam` inside `quat_propagator_wrapper` |
+
+---
+
+## 10. File Structure
+
+```
+CubeSat/CS4_QUAT_PROP/
+├── quat_propagator_wrapper.sv   ← Top-level wrapper; CS12 integration point
+├── quat_multiply.sv             ← 3-cycle pipelined Hamilton product
+├── quat_normalize.sv            ← 3-cycle Newton-Raphson normalization
+├── norm_checker.sv              ← 2-cycle post-norm health check
+├── quaternion_math.sv           ← Quaternion conjugate and utility helpers
+├── quat_propagator.sv           ← Standalone propagator core (internal)
+├── tb_quat_propagator_wrapper.sv ← Integration testbench
+└── README.md                    ← This file
+
+CubeSat/ (shared helper IPs used by CS4):
+├── cordic.sv                    ← CORDIC trigonometric engine
+├── sqrt.sv                      ← Square root calculator
+└── fp_divider.sv                ← Fixed-point divider
 ```
 
 ---
 
-## Functionality
+## 11. Interconnections
 
-1. **dq computation** — `omega[i] × DT_HALF (164) >> 15` gives ω·dt/2 in Q15. `dq = [0x7FFF, dq_x, dq_y, dq_z]`.
-2. **Register on CE** — inputs latched on `ce_100hz & q_valid_in` to enter pipeline.
-3. **Hamilton product** (`quat_multiply`, 3 cycles) — computes `q_in ⊗ dq`; 16-bit product uses 32-bit intermediate with arithmetic right-shift.
-4. **Normalisation** (`quat_normalize`, 3 cycles) — Newton-Raphson one-step correction ensures `‖q‖ = 1 ± 0.001`.
-5. **Norm health check** (`norm_checker`, 2 cycles) — verifies output is unit; sets `norm_ok` and `norm_val = |‖q_out‖²−1|`.
-
-`q_valid_out` asserts one cycle when propagation is complete; downstream (CS5/CS6) latches on this strobe.
-
----
-
-## Simulation Instructions
-
-```bash
-iverilog -g2012 -o sim_cs4 \
-  CS4_QUAT_PROP/tb_quat_propagator_wrapper.sv \
-  CS4_QUAT_PROP/quat_propagator_wrapper.sv \
-  CS4_QUAT_PROP/quat_multiply.sv \
-  CS4_QUAT_PROP/quat_normalize.sv \
-  CS4_QUAT_PROP/norm_checker.sv \
-  CS4_QUAT_PROP/quaternion_math.sv \
-  CS4_QUAT_PROP/quat_propagator.sv \
-  cordic.sv sqrt.sv fp_divider.sv
-
-vvp sim_cs4
-```
-
-```tcl
-vlog -sv CS4_QUAT_PROP/tb_quat_propagator_wrapper.sv CS4_QUAT_PROP/*.sv cordic.sv sqrt.sv fp_divider.sv
-vsim -t 1ps tb_quat_propagator_wrapper -do "run -all; quit"
-```
+| Signal | Direction | Connected Module | Purpose |
+|---|---|---|---|
+| `ce_100hz` | CS4 ← CS12 | `clk_manager` (CS12) | 100 Hz update trigger |
+| `q_in[0:3]` | CS4 ← CS5 | `ekf_wrapper` (CS5) | EKF-corrected quaternion fed back |
+| `omega[0:2]` | CS4 ← CS1 | `spi_imu_wrapper` (CS1) | Angular velocity from IMU |
+| `q_out[0:3]` | CS4 → CS5 | `ekf_wrapper` (CS5) | Predicted quaternion for EKF prediction step |
+| `q_out[0:3]` | CS4 → CS6 | `pd_control_wrapper` (CS6) | Attitude estimate for error computation |
+| `norm_error` | CS4 → CS8 | `adcs_fsm_wrapper` (CS8) | Quaternion health flag |
+| `q_norm_valid` | CS4 → CS8 | `adcs_fsm_wrapper` (CS8) | Norm validity strobe |
 
 ---
 
-## Testbench Description
+## 12. Design Considerations / Optimization Scope
 
-| Aspect | Detail |
-|---|---|
-| Type | Directed self-checking |
-| Clock | 50 MHz `sys_clk` |
-| CE strobe | Internally generated 100 Hz |
-| Stimulus | Identity quaternion + known angular rate; expected q_out computed offline |
-| Checking | Quaternion component error ≤ 2 LSB Q15; norm deviation < 0.001 |
-| Coverage | Identity propagation, pure-rate rotation, norm recovery after injected denorm |
+**Performance:**
+- Pipeline latency: 7 clock cycles (70 ns @ 100 MHz) << 10 ms cycle budget. No stalls.
+- 100 Hz update is sufficient for small-satellite angular rates (< 1 °/s typical).
 
----
+**Resource:**
+- `quat_multiply`: 4 multiply-accumulate pairs → 4 DSP48E1 (sharing possible with TDM).
+- `quat_normalize`: Newton-Raphson needs 1 multiply + 1 subtract per iteration; ≈ 2 DSP48E1.
+- Total CS4 DSP48 estimate: 3 (per plan); BRAM: 96 B (for coefficient tables).
 
-## Expected Behaviour
+**Optimization Opportunities:**
+1. Time-multiplex DSP48E1 blocks across the 4 Hamilton product terms to reduce from 4 to 1 DSP.
+2. If angular rate exceeds small-angle assumption (> 0.1 rad/step), switch to full matrix exponential for higher fidelity.
+3. Increase update rate to 500 Hz or 1 kHz by adjusting `DT_HALF` and connecting to `ce_1khz`.
 
-```
-ce_100hz           __|‾|__________________________|‾|_________
-q_valid_in         ___|‾|___________________________|‾|_______
-[pipeline 7 cycles]
-q_valid_out        __________________________|‾|______________|‾|
-q_out[0..3]        ==========================|UPDATED Q15====
-norm_ok_valid      ________________________________|‾|______________
-norm_ok            ________________________________|1|   (asserts when ‖q‖² within threshold)
-```
-
-`norm_error` asserts (pre-norm) only when `q_in` is severely denormalised (‖q‖² < 0.5).
+**Timing:**
+- Critical path: DSP48E1 multiply-accumulate chain in `quat_multiply`. Ensure registered pipeline stages.
+- `norm_error` is combinational within `quat_normalize`; pipeline if timing is tight.
 
 ---
 
-## Limitations
+## 13. Testing & Verification
 
-- Uses small-angle first-order integration — accurate for angular rates < 5 °/s; higher rates accumulate truncation error.
-- `DT_HALF` is a compile-time constant; dt variation (e.g., missed CE) is not handled.
-- No second-order Runge-Kutta option in MVP.
-- Newton-Raphson normalisation performs one iteration; may not fully converge for extreme inputs.
+**Testbench:** `CubeSat/CS4_QUAT_PROP/tb_quat_propagator_wrapper.sv`
 
----
+**Test Scenarios:**
+- Start from identity quaternion; apply zero omega → verify `q_out` remains identity.
+- Apply known constant omega = [0.1, 0, 0] rad/s for 10 cycles; verify rotation about X-axis.
+- Verify `norm_error` does not assert for normal inputs; verify it asserts on degenerate input.
+- Apply omega large enough to cause small-angle error; verify `norm_ok` still asserts post-normalize.
+- Verify pipeline latency: `q_valid_out` arrives exactly 7 cycles after `ce_100hz && q_valid_in`.
+- Verify `norm_ok_valid` arrives 2 cycles after `q_valid_out`.
 
-## Verification Status
+**Simulation Notes:**
+- Compile with `iverilog -g2012` including `cordic.sv`, `sqrt.sv`, `fp_divider.sv`.
+- Timescale: 1 ns / 1 ps.
+- Use a golden-reference model (MATLAB/Python quaternion toolbox) for numerical verification.
 
-- [x] Compiles without warnings (`iverilog -g2012`)
-- [x] Identity propagation: output matches input within 2 LSB
-- [x] Pure-yaw rotation: angular increment matches expected quaternion
-- [x] Norm health check `norm_ok` asserts correctly after normalisation
-- [x] Pipeline timing verified (7+2 cycle latency)
-- [x] Integrated in `top_cubesat_mvp` (CS12)
-- [ ] Monte-Carlo drift test over 60 s simulated time (target < 0.01°)
-- [ ] Synthesis DSP48 count confirmed (target: 3)
+**Requirements Coverage:**
+- CS-ADCS-004: q(k+1) = q(k) + 0.5×q(k)⊗ω×Δt, norm 1 ± 0.001, drift < 0.01° over 60 s.
+- Architecture: `Architecture/SUBSYSTEM_MODULE_MAPPING.md`
