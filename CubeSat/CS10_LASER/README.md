@@ -1,184 +1,243 @@
 # CS10 — Laser Pointing FSM
 
-> 8-state FSM (IDLE → SEARCH → ACQUIRE → TRACK → HOLD → COMM → FAULT → SAFE) for laser inter-satellite link pointing, with boustrophedon raster scan, spiral refinement, PD closed-loop tracking, ISL modulation, and 2-axis gimbal stepper control.
+## 1. Module Title & ID
+
+**Module:** CS10 — Laser Inter-Satellite Link Pointing FSM
+**Subsystem ID:** CS10
+**Requirements:** CS-LSR-001 through CS-LSR-010
 
 ---
 
-## Overview
+## 2. Overview
 
-| Attribute | Value |
+CS10 controls a 2-axis stepper gimbal for inter-satellite laser link (ISL) pointing. It implements an 8-state FSM that sequences through a boustrophedon SEARCH scan (± 10° az × ± 5° el), spiral ACQUIRE refinement (< 0.1° in ≤ 5 s), closed-loop PD TRACK at 100 Hz (RMS error < 0.05°), full-duplex COMM (ISL modulation active), HOLD (signal dropout recovery), and FAULT/SAFE shutdown. The gimbal stepper driver generates STEP/DIR pulses at up to 200 kHz with trapezoidal acceleration.
+
+**Target Platform:** Xilinx Artix-7 XC7A35T
+
+---
+
+## 3. Criticality
+
+**HIGH** — CS-LSR-001 to CS-LSR-010. CS10 is required for inter-satellite laser communication. Loss of CS10 does not affect attitude control (ADCS) but disables the ISL data path. `safe_mode` from CS8 causes immediate SAFE state entry.
+
+---
+
+## 4. Key Functionality
+
+- **8-State FSM:** IDLE → SEARCH → ACQUIRE → TRACK → HOLD ↔ COMM → FAULT; any state → SAFE on `!laser_enable`.
+- **SEARCH:** Boustrophedon raster scan ± 10° az × ± 5° el, ≤ 0.5°/step, via `raster_scan_engine`.
+- **ACQUIRE:** Spiral refinement ± 2°; `peak_hold_detector` tracks peak signal; `spiral_refinement` converges < 0.1° in ≤ 5 s (FAULT_TIMEOUT = 100 ticks).
+- **TRACK:** Closed-loop PD pointing at 100 Hz using `pid_controller` (reused) with `pointing_error_az/el` inputs; RMS < 0.05°.
+- **COMM:** ISL modulation enabled via `laser_modulator`; 8-bit ISL data at 100 Mb/s.
+- **HOLD:** Signal lost < HOLD_THRESH; maintains last gimbal position; transitions to FAULT if held > HOLD_TIMEOUT = 20 ticks (200 ms).
+- **Signal Monitoring:** `signal_monitor` computes 16-sample rolling average; exposes `signal_strength_filtered`.
+- **Fault Handling:** `laser_fault_handler` detects signal loss, gimbal stall, and modulator fault; `fault_code[7:0]` encodes detailed reason.
+- **Gimbal PD:** 2 `pid_controller` instances for az and el axes.
+
+---
+
+## 5. Inputs
+
+| Port | Direction | Width | Clock Domain | Description |
+|---|---|---|---|---|
+| `clk` | input | 1 | `sys_clk` | 100 MHz system clock |
+| `rst_n` | input | 1 | async | Active-low synchronous reset |
+| `ce_100hz` | input | 1 | `sys_clk` | 100 Hz clock-enable from CS12 |
+| `signal_strength[11:0]` | input | 12 | `sys_clk` | Raw ADC from laser receiver (0–4095) |
+| `signal_valid` | input | 1 | `sys_clk` | ADC reading valid |
+| `laser_enable` | input | 1 | `sys_clk` | Enable from CS8 (asserted in FINE_POINT state) |
+| `safe_mode` | input | 1 | `sys_clk` | Safe mode from CS8 (immediate shutdown) |
+| `gimbal_cmd_abs[0:1]` | input | 2 × 16 | `sys_clk` | Absolute az/el gimbal command (Q15) from external |
+| `gimbal_cmd_valid` | input | 1 | `sys_clk` | External gimbal command valid strobe |
+| `isl_data_in[7:0]` | input | 8 | `sys_clk` | ISL data byte to transmit in COMM state |
+| `isl_data_valid` | input | 1 | `sys_clk` | ISL data valid |
+| `manual_clear` | input | 1 | `sys_clk` | Uplink command to clear FAULT state |
+| `pointing_error_az` | input | 16 | `sys_clk` | Azimuth pointing error for TRACK PD (Q15) |
+| `pointing_error_el` | input | 16 | `sys_clk` | Elevation pointing error for TRACK PD (Q15) |
+
+---
+
+## 6. Outputs
+
+| Port | Direction | Width | Clock Domain | Description |
+|---|---|---|---|---|
+| `laser_mod_en` | output | 1 | `sys_clk` | Laser modulator enable (COMM state) |
+| `gimbal_step[1:0]` | output | 2 | `sys_clk` | STEP pulses for AZ/EL stepper motors |
+| `gimbal_dir[1:0]` | output | 2 | `sys_clk` | Direction signals (1 = positive / CW) |
+| `laser_state[2:0]` | output | 3 | `sys_clk` | Current FSM state (3-bit encoded) |
+| `pointing_locked` | output | 1 | `sys_clk` | Asserted in TRACK or COMM state |
+| `laser_fault` | output | 1 | `sys_clk` | Asserted in FAULT state |
+| `laser_pwm` | output | 1 | `sys_clk` | ISL PWM output during COMM state |
+| `fault_code[7:0]` | output | 8 | `sys_clk` | Detailed fault reason code |
+| `gimbal_pos_az[23:0]` | output | 24 | `sys_clk` | Current azimuth position feedback |
+| `gimbal_pos_el[23:0]` | output | 24 | `sys_clk` | Current elevation position feedback |
+| `convergence_time_100ms` | output | 8 | `sys_clk` | Spiral convergence time in 100 ms ticks |
+| `signal_strength_filtered[11:0]` | output | 12 | `sys_clk` | 16-sample rolling average of signal_strength |
+
+---
+
+## 7. Architecture
+
+```
+laser_enable, safe_mode, ce_100hz
+      │
+      ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  laser_fsm_wrapper (8-state FSM)                                 │
+│  IDLE→SEARCH→ACQUIRE→TRACK→COMM→HOLD→FAULT; any→SAFE            │
+│                                                                  │
+│  ┌───────────────────┐  az/el increments  ┌──────────────────┐  │
+│  │  raster_scan_engine│─────────────────▶ │  gimbal_controller│  │
+│  │  (SEARCH boustro.  │                   │  (STEP/DIR pulses,│  │
+│  │   ±10°az ±5°el)   │  ┌──────────────┐ │   position accum, │  │
+│  └───────────────────┘  │spiral_refinement│ trapezoidal accel)│  │
+│  ┌───────────────────┐  │(ACQUIRE ±2°) │  └──────────────────┘  │
+│  │  peak_hold_detector│  └──────────────┘                       │
+│  │  (peak tracking)  │                                           │
+│  └───────────────────┘                                           │
+│  ┌─────────────────────┐  ┌────────────────────────────────┐    │
+│  │  signal_monitor      │  │  pid_controller × 2            │    │
+│  │  (16-sample rolling  │  │  (TRACK closed-loop az, el)    │    │
+│  │   average, 10 kHz)   │  └────────────────────────────────┘    │
+│  └─────────────────────┘                                         │
+│  ┌───────────────────┐  ┌────────────────┐                       │
+│  │  laser_modulator  │  │ laser_fault_    │                      │
+│  │  (COMM: ISL mux,  │  │ handler        │──▶ fault_code         │
+│  │   laser_pwm)      │  └────────────────┘                       │
+│  └───────────────────┘                                           │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**State Encoding (`laser_state[2:0]`):**
+
+| Value | State |
 |---|---|
-| Requirements | CS-LSR-001 through CS-LSR-010 |
-| Top module | `laser_fsm_wrapper` |
-| Clock domain | `sys_clk` (50 MHz) |
-| CE strobe | 100 Hz `ce_100hz` from CS12 |
-| States | IDLE, SEARCH, ACQUIRE, TRACK, HOLD, COMM, FAULT, SAFE |
-| Tracking rate | 100 Hz closed-loop PD |
-| Gimbal axes | 2 (azimuth, elevation), stepper steps |
-| ADC signal | 12-bit, 0–4095 counts |
-| Signal threshold | `ACQ_THRESH = 512`, `HOLD_THRESH = 256` |
-| ISL data rate | 8-bit parallel @ 100 MHz |
-| BRAM | 512 B |
-| DSP48 | 2 |
+| 0 | IDLE |
+| 1 | SEARCH |
+| 2 | ACQUIRE |
+| 3 | TRACK |
+| 4 | HOLD |
+| 5 | COMM |
+| 6 | FAULT |
+| 7 | SAFE |
+
+**Reused Helper IPs (from `CubeSat/`):**
+- `pid_controller.sv` — PD closed-loop pointing control (2 instances, az + el)
+- `pwm_gen.sv` — Laser modulator PWM generation
+- `stepper_driver.sv` — Gimbal STEP/DIR pulse generation
+- `lpf.sv` — Low-pass filter on signal strength input
 
 ---
 
-## File Structure
+## 8. Data Formats
 
-| File | Purpose |
-|---|---|
-| `laser_fsm_wrapper.sv` | Top-level — state machine, signal routing, output mux |
-| `raster_scan_engine.sv` | Boustrophedon ±10° az × ±5° el scan pattern, ≤0.5° step |
-| `spiral_refinement.sv` | Spiral ±2° reducing 50 %/pass; reports `spiral_converged` |
-| `peak_hold_detector.sv` | Tracks signal peak across acquisition window |
-| `signal_monitor.sv` | 10 kHz sampling, rolling average, threshold compare |
-| `laser_modulator.sv` | ISL 8-bit data modulation in COMM state |
-| `laser_fault_handler.sv` | 8-entry fault FIFO; safe-state enforcement |
-| `gimbal_controller.sv` | Absolute/relative stepper commands; position tracking |
-| `tb_laser_fsm_wrapper.sv` | Self-checking directed testbench |
+| Signal | Format | Notes |
+|---|---|---|
+| `signal_strength[11:0]` | 12-bit unsigned | 0 = no signal, 4095 = full-scale ADC |
+| `signal_strength_filtered[11:0]` | 12-bit unsigned | 16-sample rolling average |
+| `gimbal_cmd_abs[0:1]` | Q15 signed (16-bit) | Pointing angle; 1.0 = max travel |
+| `pointing_error_az/el` | Q15 signed (16-bit) | Error in radians (or angle units) |
+| `gimbal_pos_az/el[23:0]` | 24-bit signed | Step count × step_resolution |
+| `convergence_time_100ms` | 8-bit unsigned | Ticks of ce_100hz to convergence |
 
-Shared primitives used: `pid_controller.sv`, `pwm_gen.sv`, `lpf.sv`, `stepper_driver.sv`.
+**FSM Thresholds:**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `ACQ_THRESH` | 512 | ADC counts: SEARCH → ACQUIRE |
+| `HOLD_THRESH` | 256 | ADC counts: below = dropout |
+| `ACQ_CONFIRM` | 5 | Consecutive ticks above ACQ_THRESH |
+| `HOLD_TIMEOUT` | 20 | ce_100hz ticks before HOLD → FAULT (200 ms) |
+| `FAULT_TIMEOUT` | 100 | ce_100hz ticks before FAULT (1 s) |
+| `SEARCH_THRESH` | 300 | Peak to advance from SEARCH → ACQUIRE |
 
 ---
 
-## Module Interface
+## 9. Register Interface
 
-```systemverilog
-module laser_fsm_wrapper #(
-    parameter int ACQ_THRESH    = 512,
-    parameter int HOLD_THRESH   = 256,
-    parameter int HOLD_TIMEOUT  = 20,   // ce_100hz ticks
-    parameter int FAULT_TIMEOUT = 100,  // ce_100hz ticks
-    parameter int SEARCH_THRESH = 300
-)(
-    input  logic        clk,
-    input  logic        rst_n,
-    input  logic        ce_100hz,
+CS10 has **no AXI4-Lite register interface** in the current implementation. All thresholds are compile-time parameters. For ground-configurable thresholds (e.g., different signal environments), these should be promoted to AXI4-Lite registers.
 
-    input  logic [11:0] signal_strength,        // 12-bit optical ADC
-    input  logic        signal_valid,
+---
 
-    input  logic        laser_enable,            // from CS8 (FINE_POINT mode)
-    input  logic        safe_mode,               // from CS8 (immediate shutdown)
+## 10. File Structure
 
-    input  logic signed [15:0] gimbal_cmd_abs [0:1],  // abs az/el command Q8.8°
-    input  logic               gimbal_cmd_valid,
+```
+CubeSat/CS10_LASER/
+├── laser_fsm_wrapper.sv       ← Top-level 8-state FSM wrapper; CS12 integration point
+├── raster_scan_engine.sv      ← SEARCH boustrophedon ±10°az ×±5°el pattern generator
+├── spiral_refinement.sv       ← ACQUIRE spiral convergence pattern
+├── peak_hold_detector.sv      ← Signal strength peak tracking during ACQUIRE
+├── signal_monitor.sv          ← 16-sample rolling average; 10 kHz sampling
+├── gimbal_controller.sv       ← 2-axis STEP/DIR generation; position accumulator
+├── laser_modulator.sv         ← ISL data mux; laser_pwm generation (COMM)
+├── laser_fault_handler.sv     ← Fault detection; fault_code encoding
+├── tb_laser_fsm_wrapper.sv    ← Integration testbench
+└── README.md                  ← This file
 
-    input  logic [7:0]  isl_data_in,
-    input  logic        isl_data_valid,
-
-    input  logic        manual_clear,            // uplink: clear FAULT state
-
-    input  logic signed [15:0] pointing_error_az,  // track error input
-    input  logic signed [15:0] pointing_error_el,
-
-    output logic        laser_mod_en,
-    output logic [1:0]  gimbal_step,
-    output logic [1:0]  gimbal_dir,
-    output logic [2:0]  laser_state,             // 3-bit state encoding
-    output logic        pointing_locked,
-    output logic        laser_fault,
-    output logic        laser_pwm,               // ISL carrier (COMM state)
-    output logic [7:0]  fault_code,
-    output logic signed [23:0] gimbal_pos_az,
-    output logic signed [23:0] gimbal_pos_el,
-    output logic [7:0]  convergence_time_100ms,
-    output logic [11:0] signal_strength_filtered
-);
+CubeSat/ (shared helper IPs used by CS10):
+├── pid_controller.sv          ← PD tracking controller (2 instances)
+├── pwm_gen.sv                 ← PWM generator for laser modulator
+├── stepper_driver.sv          ← STEP/DIR pulse generator
+└── lpf.sv                     ← Low-pass filter (signal noise rejection)
 ```
 
 ---
 
-## Functionality
+## 11. Interconnections
 
-### State Machine
-
-| State | Behaviour |
-|---|---|
-| IDLE | Home position (0°, 0°); modulator disabled; awaits `laser_enable` |
-| SEARCH | Boustrophedon raster ±10° az × ±5° el; `raster_scan_engine` steps gimbal; advances to ACQUIRE when `signal_strength > SEARCH_THRESH` |
-| ACQUIRE | `spiral_refinement` centres on peak; reduces spiral radius 50 %/pass; advances to TRACK on `spiral_converged` |
-| TRACK | PD closed-loop (`pid_controller`) @ 100 Hz on `pointing_error_az/el`; transitions to COMM on `isl_data_valid` |
-| HOLD | Maintains last gimbal position; returns to TRACK/COMM when signal recovers; → FAULT after `HOLD_TIMEOUT` ticks |
-| COMM | Modulates ISL data via `laser_modulator`; maintains track; → HOLD on signal loss |
-| FAULT | Disables emission and motion; logs fault code to 8-entry FIFO; clears only on `manual_clear & !gimbal_busy` |
-| SAFE | Immediate shutdown on `!laser_enable`; returns to IDLE on `laser_enable & !gimbal_busy` |
-
-### Signal monitoring
-`signal_monitor` samples at 10 kHz, applies IIR LPF (`lpf.sv`), and exports `signal_strength_filtered`.
+| Signal | Direction | Connected Module | Purpose |
+|---|---|---|---|
+| `ce_100hz` | CS10 ← CS12 | `clk_manager` (CS12) | 100 Hz FSM tick |
+| `laser_enable` | CS10 ← CS8 | `adcs_fsm_wrapper` (CS8) | Enable when FINE_POINT state |
+| `safe_mode` | CS10 ← CS8 | `adcs_fsm_wrapper` (CS8) | Immediate SAFE shutdown |
+| `laser_state`, `pointing_locked` | CS10 → CS11 | `telemetry_wrapper` (CS11) | Laser status telemetry (APID 0x0103) |
+| `laser_fault` | CS10 → CS11 | `telemetry_wrapper` (CS11) | Fault status telemetry |
+| `gimbal_step/dir` | CS10 → Physical | FPGA I/O | Stepper motor driver ICs |
+| `laser_mod_en`, `laser_pwm` | CS10 → Physical | FPGA I/O | Laser modulator enable and PWM |
 
 ---
 
-## Simulation Instructions
+## 12. Design Considerations / Optimization Scope
 
-```bash
-iverilog -g2012 -o sim_cs10 \
-  CS10_LASER/tb_laser_fsm_wrapper.sv \
-  CS10_LASER/laser_fsm_wrapper.sv \
-  CS10_LASER/raster_scan_engine.sv \
-  CS10_LASER/spiral_refinement.sv \
-  CS10_LASER/peak_hold_detector.sv \
-  CS10_LASER/signal_monitor.sv \
-  CS10_LASER/laser_modulator.sv \
-  CS10_LASER/laser_fault_handler.sv \
-  CS10_LASER/gimbal_controller.sv \
-  pid_controller.sv pwm_gen.sv lpf.sv stepper_driver.sv
+**Performance:**
+- SEARCH scan covers 20° × 10° in (20/0.5) × (10/0.5) / 100 Hz = 80 s worst-case.
+- ACQUIRE convergence requirement: < 0.1° in ≤ 5 s (500 ce_100hz ticks).
+- TRACK RMS error: < 0.05° requires PID gains tuned to gimbal inertia and ADC noise.
 
-vvp sim_cs10
-```
+**Resource:**
+- DSP48E1: 2 (per plan) for PID multiply-accumulate (az + el).
+- BRAM: 512 B (per plan) for scan pattern tables and peak history.
 
-```tcl
-vlog -sv CS10_LASER/tb_laser_fsm_wrapper.sv CS10_LASER/*.sv pid_controller.sv pwm_gen.sv lpf.sv stepper_driver.sv
-vsim -t 1ps tb_laser_fsm_wrapper -do "run -all; quit"
-```
+**Optimization Opportunities:**
+1. Promote FSM thresholds to AXI4-Lite registers for ground-configurable tuning.
+2. Increase ADC sampling rate above 10 kHz for faster signal detection in acquisition.
+3. Add velocity feed-forward to gimbal controller for faster transient response during TRACK.
+4. Implement look-ahead prediction using CS9 orbit geometry for SEARCH starting angle.
+
+**Timing:**
+- STEP/DIR pulses up to 200 kHz must be generated deterministically; use a dedicated counter in `stepper_driver`.
+- `signal_monitor` rolling average: 16 samples at 10 kHz = 1.6 ms response time.
 
 ---
 
-## Testbench Description
+## 13. Testing & Verification
 
-| Aspect | Detail |
-|---|---|
-| Type | Directed self-checking |
-| Clock | 50 MHz; CE at 100 Hz internally generated |
-| Stimulus | Scripted signal-strength waveform stepping through SEARCH → ACQUIRE → TRACK → COMM → FAULT |
-| Checking | State encoding at each transition; `pointing_locked` timing; fault-code FIFO after FAULT |
-| Coverage | Full state graph traversal, safe-mode immediate shutdown, `manual_clear` recovery, hold timeout, signal recovery |
+**Testbench:** `CubeSat/CS10_LASER/tb_laser_fsm_wrapper.sv`
 
----
+**Test Scenarios:**
+- Assert `laser_enable = 0`; verify FSM remains in IDLE/SAFE.
+- Assert `laser_enable = 1`, `signal_valid = 1`, `signal_strength = 0`; verify SEARCH scan begins (gimbal_step pulses observed).
+- Assert `signal_strength > ACQ_THRESH` for 5 consecutive ticks; verify SEARCH → ACQUIRE → TRACK.
+- In TRACK state, drop `signal_strength` below `HOLD_THRESH`; verify TRACK → HOLD.
+- Hold in HOLD for > 20 ticks; verify HOLD → FAULT.
+- Assert `manual_clear` in FAULT; verify FAULT → IDLE.
+- Assert `safe_mode = 1` from any state; verify immediate → SAFE.
+- Verify `signal_strength_filtered` is stable 16-sample average of `signal_strength`.
 
-## Expected Behaviour
+**Simulation Notes:**
+- Compile with `iverilog -g2012` including `pid_controller.sv`, `pwm_gen.sv`, `stepper_driver.sv`, `lpf.sv`.
+- Timescale: 1 ns / 1 ps.
 
-```
-laser_enable       _____|‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
-safe_mode          ‾‾‾‾‾|_____________________________|‾_
-laser_state[2:0]:  IDLE → SEARCH → ACQUIRE → TRACK → COMM
-signal_strength:   0 → ramp up past SEARCH_THRESH → peak → tracking oscillation
-pointing_locked:   _____________________________|‾‾‾‾‾‾‾‾
-gimbal_step[1:0]:  stepper pulses visible during SEARCH/ACQUIRE
-laser_pwm:         ___________________________|‾‾carrier‾
-fault_code:        0x00 until signal lost > HOLD_TIMEOUT
-```
-
----
-
-## Limitations
-
-- 2-axis gimbal model only; does not represent full 3-axis mechanical system.
-- Optical channel effects (beam divergence, atmospheric turbulence) not modelled.
-- PD gain (`pid_controller` Kp/Kd) is a compile-time parameter; no runtime command path.
-- `manual_clear` has no command authentication in MVP.
-
----
-
-## Verification Status
-
-- [x] Compiles without warnings (`iverilog -g2012`)
-- [x] All 8 states reached; transitions verified
-- [x] `safe_mode` immediate shutdown within 1 cycle confirmed
-- [x] Raster scan step pattern verified
-- [x] Spiral convergence assertion within `HOLD_TIMEOUT`
-- [x] Fault FIFO captures correct fault code
-- [x] `manual_clear` recovery from FAULT tested
-- [x] Integrated in `top_cubesat_mvp` (CS12)
-- [ ] PD gain runtime command interface
-- [ ] Synthesis timing closure; DSP48 count confirmed (target: 2)
+**Requirements Coverage:**
+- CS-LSR-001 to CS-LSR-010: 8-state FSM, boustrophedon SEARCH ±10°az×±5°el, spiral ACQUIRE < 0.1° in 5 s, TRACK RMS < 0.05°, ISL modulation, HOLD/FAULT recovery.
+- Architecture: `Architecture/SUBSYSTEM_MODULE_MAPPING.md`
