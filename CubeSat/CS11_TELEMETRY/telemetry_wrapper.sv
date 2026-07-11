@@ -51,6 +51,8 @@ module telemetry_wrapper #(
     input  logic        laser_valid,
     input  logic [7:0]  hk_tlm    [0:17],   // 18-byte HK packet (CS-TLM-007)
     input  logic        hk_valid,
+    input  logic [7:0]  prop_tlm   [0:19],   // 20-byte Propagated Quat packet (CS4 output)
+    input  logic        prop_valid,
 
     // Timestamp (mission elapsed time in seconds, for frame header)
     input  logic [31:0] uptime_sec,
@@ -124,33 +126,50 @@ module telemetry_wrapper #(
     logic [15:0] mux_apid;
     logic        mux_frame_start;
 
+    logic prop_send_flag;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) prop_send_flag <= 1'b0;
+        else if (ce_1hz) prop_send_flag <= ~prop_send_flag;  // Toggle every 100ms
+    end
     // Payload mux (combinational)
+    // Line ~141-170: Replace the entire case statement with this:
+    
     always_comb begin
         for (int i = 0; i < MAX_PAYLOAD; i++) mux_payload[i] = 8'h00;
         mux_payload_len = 8'd18;
         mux_apid        = 16'h0100;
-
+    
         case (arb_packet_select)
             2'd0: begin  // HK
                 for (int i = 0; i < 18; i++) mux_payload[i] = hk_tlm[i];
                 mux_payload_len = 8'd18;
                 mux_apid        = 16'h0100;
             end
-            2'd1: begin  // ADCS
-                for (int i = 0; i < 44; i++) mux_payload[i] = adcs_tlm[i];
-                mux_payload_len = 8'd44;
-                mux_apid        = 16'h0101;
+            
+            2'd1: begin  // ADCS or PROP (alternating based on prop_send_flag)
+                if (prop_send_flag) begin
+                    for (int i = 0; i < 20; i++) mux_payload[i] = prop_tlm[i];
+                    mux_payload_len = 8'd20;
+                    mux_apid        = 16'h0104;
+                end else begin
+                    for (int i = 0; i < 44; i++) mux_payload[i] = adcs_tlm[i];
+                    mux_payload_len = 8'd44;
+                    mux_apid        = 16'h0101;
+                end
             end
+            
             2'd2: begin  // Orbit
                 for (int i = 0; i < 47; i++) mux_payload[i] = orbit_tlm[i];
                 mux_payload_len = 8'd47;
                 mux_apid        = 16'h0102;
             end
+            
             2'd3: begin  // Laser
                 for (int i = 0; i < 20; i++) mux_payload[i] = laser_tlm[i];
                 mux_payload_len = 8'd20;
                 mux_apid        = 16'h0103;
             end
+            
             default: ;
         endcase
     end

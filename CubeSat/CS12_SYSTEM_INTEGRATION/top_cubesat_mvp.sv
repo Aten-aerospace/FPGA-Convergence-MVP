@@ -142,7 +142,8 @@ module top_cubesat_mvp #(
         .CLK_HZ (CLK_HZ),
         .SPI_HZ (SPI_HZ)
     ) u_cs1 (
-        .clk              (clk_100mhz),
+        .clk_100mhz       (clk_100mhz),
+        .sys_clk          (clk_100mhz),
         .rst_n            (rst_n),
         .imu_read_trigger (ce_100hz),
         .spi_sclk         (imu_spi_sclk),
@@ -159,6 +160,7 @@ module top_cubesat_mvp #(
         .mag_y            (imu_mag_y),
         .mag_z            (imu_mag_z),
         .imu_data_valid   (imu_data_valid),
+        .crc_pass         (),
         .imu_busy         (),
         .imu_fault        (imu_fault),
         .imu_overflow     ()
@@ -167,24 +169,32 @@ module top_cubesat_mvp #(
     // =========================================================================
     // CS2 — Magnetometer I2C wrapper
     // =========================================================================
+    logic signed [15:0] mag_data    [0:2];  // calibrated mag readings array
     logic signed [15:0] mag_x, mag_y, mag_z;
     logic               mag_data_valid;
     logic               mag_fault;
 
+    // Flatten array to individual named signals for EKF
+    always_comb begin
+        mag_x = mag_data[0];
+        mag_y = mag_data[1];
+        mag_z = mag_data[2];
+    end
+
     i2c_mag_wrapper #(
         .CLK_HZ (CLK_HZ)
     ) u_cs2 (
-        .clk              (clk_100mhz),
+        .sys_clk          (clk_100mhz),
         .rst_n            (rst_n),
         .mag_read_trigger (ce_100hz),
         .i2c_sda          (mag_i2c_sda),
         .i2c_scl          (mag_i2c_scl),
-        .mag_x            (mag_x),
-        .mag_y            (mag_y),
-        .mag_z            (mag_z),
-        .mag_data_valid   (mag_data_valid),
+        .mag_data         (mag_data),
+        .mag_ut           (),
+        .mag_valid        (mag_data_valid),
         .mag_busy         (),
-        .mag_fault        (mag_fault)
+        .mag_fault        (mag_fault),
+        .mag_age_ms       ()
     );
 
     // =========================================================================
@@ -197,19 +207,31 @@ module top_cubesat_mvp #(
     sun_sensor_wrapper #(
         .CLK_HZ (CLK_HZ)
     ) u_cs3 (
-        .clk            (clk_100mhz),
-        .rst_n          (rst_n),
-        .sun_trigger    (ce_100hz),
-        .spi_sclk       (sun_spi_sclk),
-        .spi_mosi       (sun_spi_mosi),
-        .spi_miso       (sun_spi_miso),
-        .spi_cs_n       (sun_spi_cs_n),
-        .sun_alpha      (sun_alpha),
-        .sun_beta       (sun_beta),
-        .sun_present    (sun_present),
-        .sun_data_valid (sun_data_valid),
-        .sun_busy       (),
-        .sun_fault      ()
+        .clk_100mhz          (clk_100mhz),
+        .sys_clk             (clk_100mhz),
+        .rst_n               (rst_n),
+        .sun_trigger         (ce_100hz),
+        // IMU SPI mux — in this MVP IMU and sun use separate SPI buses, so tie off
+        .imu_spi_req         (1'b0),
+        .imu_sclk            (1'b0),
+        .imu_mosi            (1'b0),
+        .imu_cs_n            (1'b1),
+        .imu_grant           (),
+        .imu_miso            (),
+        // Physical SPI bus to sun sensor ADC
+        .spi_sclk            (sun_spi_sclk),
+        .spi_mosi            (sun_spi_mosi),
+        .spi_miso            (sun_spi_miso),
+        .spi_cs_imu_n        (),          // IMU shares this in mux mode; unused
+        .spi_cs_adc_n        (sun_spi_cs_n),
+        .sun_channel         (),
+        .sun_alpha           (sun_alpha),
+        .sun_beta            (sun_beta),
+        .sun_valid           (sun_data_valid),
+        .sun_present         (sun_present),
+        .sun_presence_age_ms (),
+        .sun_busy            (),
+        .sun_fault           ()
     );
 
     // =========================================================================
@@ -281,30 +303,52 @@ module top_cubesat_mvp #(
     // CS6 — PD control wrapper
     // Quaternion error = q_est (target = identity, so q_err ≈ q_est[1:3])
     // =========================================================================
-    logic signed [15:0] pd_q_err     [0:2];
+    logic signed [15:0] pd_q_err     [0:3];   // full quaternion [w,x,y,z]
     logic signed [15:0] pd_omega     [0:2];
     logic signed [15:0] torque_cmd   [0:2];
     logic               pd_cmd_valid;
 
     always_comb begin
-        pd_q_err[0] = q_est[1];  // vector part of quaternion error
-        pd_q_err[1] = q_est[2];
-        pd_q_err[2] = q_est[3];
+        pd_q_err[0] = q_est[0];  // scalar (w) part
+        pd_q_err[1] = q_est[1];  // vector part of quaternion error
+        pd_q_err[2] = q_est[2];
+        pd_q_err[3] = q_est[3];
         pd_omega[0] = imu_gyro_x;
         pd_omega[1] = imu_gyro_y;
         pd_omega[2] = imu_gyro_z;
     end
 
     pd_control_wrapper u_cs6 (
-        .clk        (clk_100mhz),
-        .rst_n      (rst_n),
-        .ce_1khz    (ce_1khz),
-        .q_err      (pd_q_err),
-        .omega      (pd_omega),
-        .ctrl_valid (ekf_valid),
-        .torque_cmd (torque_cmd),
-        .sat_flag   (),
-        .cmd_valid  (pd_cmd_valid)
+        .clk            (clk_100mhz),
+        .rst_n          (rst_n),
+        .ce_1khz        (ce_1khz),
+        .q_err          (pd_q_err),
+        .omega          (pd_omega),
+        .meas_valid     (ekf_valid),
+        .Kp_coeff       (16'sd0),      // use internal defaults
+        .Kd_coeff       (16'sd0),
+        .axi_gain_write (1'b0),
+        .torque_cmd     (torque_cmd),
+        .saturation_flag(),
+        .sat_count      (),
+        .ctrl_valid     (pd_cmd_valid),
+        // AXI4-Lite — tie off (not used in MVP)
+        .axi_awaddr     (4'h0),
+        .axi_awvalid    (1'b0),
+        .axi_awready    (),
+        .axi_wdata      (16'h0),
+        .axi_wvalid     (1'b0),
+        .axi_wready     (),
+        .axi_bresp      (),
+        .axi_bvalid     (),
+        .axi_bready     (1'b1),
+        .axi_araddr     (4'h0),
+        .axi_arvalid    (1'b0),
+        .axi_arready    (),
+        .axi_rdata      (),
+        .axi_rresp      (),
+        .axi_rvalid     (),
+        .axi_rready     (1'b1)
     );
 
     // =========================================================================
@@ -317,16 +361,17 @@ module top_cubesat_mvp #(
     logic [7:0]  fault_flags_int;
     logic        mode_valid_int;
 
+    // Absolute values computed outside always_comb for iverilog compatibility
+    logic [15:0] abs_gyro_x, abs_gyro_y, abs_gyro_z;
+    always_comb abs_gyro_x = imu_gyro_x[15] ? (~imu_gyro_x + 16'd1) : imu_gyro_x;
+    always_comb abs_gyro_y = imu_gyro_y[15] ? (~imu_gyro_y + 16'd1) : imu_gyro_y;
+    always_comb abs_gyro_z = imu_gyro_z[15] ? (~imu_gyro_z + 16'd1) : imu_gyro_z;
+
     always_comb begin
-        // omega_mag = unsigned max of |gyro_x|, |gyro_y|, |gyro_z|
-        logic [15:0] ax, ay, az;
-        ax = imu_gyro_x[15] ? 16'(-$signed(imu_gyro_x)) : 16'(imu_gyro_x);
-        ay = imu_gyro_y[15] ? 16'(-$signed(imu_gyro_y)) : 16'(imu_gyro_y);
-        az = imu_gyro_z[15] ? 16'(-$signed(imu_gyro_z)) : 16'(imu_gyro_z);
-        omega_mag_unsigned = (ax > ay && ax > az) ? ax :
-                             (ay > az)            ? ay : az;
-        // q_err_mag = |q_est[1]|
-        q_err_mag_unsigned = q_est[1][15] ? 16'(-$signed(q_est[1])) : 16'(q_est[1]);
+        omega_mag_unsigned = (abs_gyro_x > abs_gyro_y && abs_gyro_x > abs_gyro_z) ? abs_gyro_x :
+                             (abs_gyro_y > abs_gyro_z)                             ? abs_gyro_y
+                                                                                   : abs_gyro_z;
+        q_err_mag_unsigned = q_est[1][15] ? (~q_est[1] + 16'd1) : q_est[1];
     end
 
     logic [2:0] adcs_mode_int;
@@ -334,20 +379,30 @@ module top_cubesat_mvp #(
     logic       safe_mode_int;
 
     adcs_fsm_wrapper u_cs8 (
-        .clk         (clk_100mhz),
-        .rst_n       (rst_n),
-        .ce_100hz    (ce_100hz),
-        .imu_valid   (imu_data_valid),
-        .mag_valid   (mag_data_valid),
-        .ekf_valid   (ekf_valid),
-        .q_err_mag   (q_err_mag_unsigned),
-        .omega_mag   (omega_mag_unsigned),
-        .uplink_mode (3'd7),            // UL_NONE (connect to command decoder for flight)
-        .adcs_mode   (adcs_mode_int),
-        .mode_valid  (mode_valid_int),
-        .health_ok   (health_ok_int),
-        .fault_flags (fault_flags_int),
-        .adcs_fault  (adcs_fault_int)
+        .clk                (clk_100mhz),
+        .rst_n              (rst_n),
+        .ce_100hz           (ce_100hz),
+        .imu_valid          (imu_data_valid),
+        .mag_valid          (mag_data_valid),
+        .ekf_valid          (ekf_valid),
+        .q_err_mag          (q_err_mag_unsigned),
+        .omega_mag          (omega_mag_unsigned),
+        .uplink_mode        (3'd7),    // UL_NONE — tie off until command decoder connected
+        .uplink_cmd_valid   (1'b1),    // always-valid (no timeout)
+        .fault_trigger      (8'h00),   // no external fault injection in MVP
+        .q_est              ({q_est[0][7:0], q_est[1][7:0], q_est[2][7:0], q_est[3][7:0]}),
+        .omega_in           ({imu_gyro_x[7:0], imu_gyro_y[7:0], imu_gyro_z[7:0]}),
+        .bram_log_rd_addr   (8'h00),
+        .bram_log_rd_data   (),
+        .bram_log_addr      (),
+        .bram_log_data      (),
+        .bram_log_wr_en     (),
+        .adcs_mode          (adcs_mode_int),
+        .mode_valid         (mode_valid_int),
+        .health_ok          (health_ok_int),
+        .fault_flags        (fault_flags_int),
+        .adcs_fault         (adcs_fault_int),
+        .per_axis_faults    ()
     );
 
     // safe_mode: assert when FSM is in SAFE (4) or FAULT (5)
@@ -356,29 +411,45 @@ module top_cubesat_mvp #(
     // =========================================================================
     // CS7 — Actuator wrapper
     // =========================================================================
-    // dipole_cmd: zero for MVP (connect mag torque controller for flight)
-    logic signed [15:0] dipole_cmd [0:2];
-    always_comb for (int i = 0; i < 3; i++) dipole_cmd[i] = 16'sd0;
-
     logic actuator_fault_int;
+
+    // Internal SPI wires for reaction wheels (not exposed at top level in MVP)
+    logic        rw_sclk_int;
+    logic [2:0]  rw_mosi_int;
+    logic [2:0]  rw_cs_n_int;
+    logic [2:0]  rw_fault_int;
 
     actuator_wrapper #(
         .CLK_HZ (CLK_HZ)
     ) u_cs7 (
-        .clk            (clk_100mhz),
-        .rst_n          (rst_n),
-        .ce_1khz        (ce_1khz),
-        .torque_cmd     (torque_cmd),
-        .dipole_cmd     (dipole_cmd),
-        .cmd_valid      (pd_cmd_valid),
-        .safe_mode      (safe_mode_int),
-        .pwm_rw         (pwm_rw),
-        .rw_enable      (rw_enable),
-        .pwm_mtq        (pwm_mtq),
-        .dir_mtq        (dir_mtq),
-        .mtq_enable     (mtq_enable),
-        .actuator_fault (actuator_fault_int)
+        .sys_clk         (clk_100mhz),
+        .clk_100mhz      (clk_100mhz),
+        .rst_n           (rst_n),
+        .ce_1khz         (ce_1khz),
+        .torque_cmd      (torque_cmd),
+        .cmd_valid       (pd_cmd_valid),
+        .safe_mode       (safe_mode_int),
+        // Reaction-wheel SPI
+        .rw_sclk         (rw_sclk_int),
+        .rw_mosi         (rw_mosi_int),
+        .rw_cs_n         (rw_cs_n_int),
+        .rw_miso         (3'b111),      // no slave present in MVP
+        // Reaction-wheel outputs
+        .rw_enable       (rw_enable),
+        .rw_fault        (rw_fault_int),
+        // Magnetorquer outputs
+        .mtq_pwm         (pwm_mtq),
+        .dir_mtq         (dir_mtq),
+        .mtq_enable      (mtq_enable),
+        .mtq_sat_flag    (),
+        .coupling_warning()
     );
+
+    // Aggregate RW faults to top-level actuator_fault signal
+    always_comb actuator_fault_int = |rw_fault_int;
+
+    // Map RW SPI CS_N to pwm_rw for hardware visibility (MVP tie-off)
+    assign pwm_rw = rw_cs_n_int;
 
     // =========================================================================
     // CS9 — Orbit propagator wrapper
@@ -392,6 +463,14 @@ module top_cubesat_mvp #(
     logic        orb_valid_int;
     logic        orb_fault;
 
+    // New CS9 inputs — declared as signals for array port connections
+    logic [7:0]  cs9_tle_line1 [0:68];
+    logic [7:0]  cs9_tle_line2 [0:68];
+    logic [31:0] cs9_sat2_pos  [0:2];
+    logic [31:0] cs9_sat2_vel  [0:2];
+    logic [31:0] cs9_sat3_pos  [0:2];
+    logic [31:0] cs9_sat3_vel  [0:2];
+
     always_comb begin
         // Default TLE: nominal ISS-like orbit
         tle_data[0] = 32'h0001_6800;   // n0 LEO
@@ -401,21 +480,72 @@ module top_cubesat_mvp #(
         tle_data[4] = 32'h0000_0000;
         tle_data[5] = 32'h0000_0000;
         tle_write   = 1'b0;            // tie off until command decoder connected
+        // Tie off new array inputs
+        for (int i = 0; i <= 68; i++) begin
+            cs9_tle_line1[i] = 8'h20;  // ASCII space
+            cs9_tle_line2[i] = 8'h20;
+        end
+        for (int i = 0; i < 3; i++) begin
+            cs9_sat2_pos[i] = 32'h0;
+            cs9_sat2_vel[i] = 32'h0;
+            cs9_sat3_pos[i] = 32'h0;
+            cs9_sat3_vel[i] = 32'h0;
+        end
     end
 
     orbit_propagator_wrapper u_cs9 (
-        .clk       (clk_100mhz),
-        .rst_n     (rst_n),
-        .ce_1hz    (ce_1hz),
-        .tle_data  (tle_data),
-        .tle_write (tle_write),
-        .eci_pos   (eci_pos),
-        .eci_vel   (eci_vel),
-        .lvlh_x    (lvlh_x),
-        .lvlh_y    (lvlh_y),
-        .lvlh_z    (lvlh_z),
-        .orb_valid (orb_valid_int),
-        .orb_fault (orb_fault)
+        .clk              (clk_100mhz),
+        .rst_n            (rst_n),
+        .ce_1hz           (ce_1hz),
+        // Pre-parsed TLE element bus (backward-compatible)
+        .tle_data         (tle_data),
+        .tle_write        (tle_write),
+        // Backward-compatible outputs
+        .eci_pos          (eci_pos),
+        .eci_vel          (eci_vel),
+        .lvlh_x           (lvlh_x),
+        .lvlh_y           (lvlh_y),
+        .lvlh_z           (lvlh_z),
+        .orb_valid        (orb_valid_int),
+        .orb_fault        (orb_fault),
+        // New inputs — tied off until uplink command decoder is connected
+        .tle_line1        (cs9_tle_line1),
+        .tle_line2        (cs9_tle_line2),
+        .tle_raw_write    (1'b0),
+        .met_load_value   (32'h0),
+        .met_write        (1'b0),
+        .gnd_lat_rad      (32'h0),
+        .gnd_lon_rad      (32'h0),
+        .gnd_alt_m        (32'h0),
+        .sat_id           (2'd0),
+        .sat2_pos         (cs9_sat2_pos),
+        .sat2_vel         (cs9_sat2_vel),
+        .sat3_pos         (cs9_sat3_pos),
+        .sat3_vel         (cs9_sat3_vel),
+        // New outputs — unused in MVP
+        .orbital_elements (),
+        .true_anomaly     (),
+        .lvlh_matrix      (),
+        .met_counter      (),
+        .epoch_tracked    (),
+        .latitude_rad     (),
+        .longitude_rad    (),
+        .altitude_m       (),
+        .ground_track_valid(),
+        .elevation_angle_deg(),
+        .contact_valid    (),
+        .aos_predicted_secs(),
+        .los_predicted_secs(),
+        .delta_r_eci      (),
+        .delta_v_eci      (),
+        .separation_km    (),
+        .propagator_valid (),
+        .overflow_flag    (),
+        .tle_age_hours    (),
+        .tle_stale        (),
+        .tle_checksum_ok  (),
+        .position_magnitude_km(),
+        .velocity_magnitude_kmps()
     );
 
     // =========================================================================
@@ -427,21 +557,45 @@ module top_cubesat_mvp #(
     logic        pointing_locked_int;
     logic        laser_fault_int;
 
+    // Intermediate signals for array port connections
+    logic signed [15:0] cs10_gimbal_cmd_abs [0:1];
+    always_comb begin
+        cs10_gimbal_cmd_abs[0] = 16'sd0;
+        cs10_gimbal_cmd_abs[1] = 16'sd0;
+    end
+
     always_comb laser_enable_int = (adcs_mode_int == 3'd3);
 
     laser_fsm_wrapper u_cs10 (
-        .clk             (clk_100mhz),
-        .rst_n           (rst_n),
-        .ce_100hz        (ce_100hz),
-        .signal_strength (12'h000),    // connect to ADC in hardware build
-        .signal_valid    (1'b0),       // tie off until ADC connected
-        .laser_enable    (laser_enable_int),
-        .laser_mod_en    (laser_mod_en),
-        .gimbal_step     (gimbal_step),
-        .gimbal_dir      (gimbal_dir),
-        .laser_state     (laser_state_int),
-        .pointing_locked (pointing_locked_int),
-        .laser_fault     (laser_fault_int)
+        .clk                     (clk_100mhz),
+        .rst_n                   (rst_n),
+        .ce_100hz                (ce_100hz),
+        .signal_strength         (12'h000),    // connect to ADC in hardware build
+        .signal_valid            (1'b0),       // tie off until ADC connected
+        .laser_enable            (laser_enable_int),
+        // New inputs — tied off in MVP
+        .safe_mode               (safe_mode_int),
+        .gimbal_cmd_abs          (cs10_gimbal_cmd_abs),
+        .gimbal_cmd_valid        (1'b0),
+        .isl_data_in             (8'h00),
+        .isl_data_valid          (1'b0),
+        .manual_clear            (1'b0),
+        .pointing_error_az       (16'sd0),
+        .pointing_error_el       (16'sd0),
+        // Outputs
+        .laser_mod_en            (laser_mod_en),
+        .gimbal_step             (gimbal_step),
+        .gimbal_dir              (gimbal_dir),
+        .laser_state             (laser_state_int),
+        .pointing_locked         (pointing_locked_int),
+        .laser_fault             (laser_fault_int),
+        // New outputs — unused in MVP
+        .laser_pwm               (),
+        .fault_code              (),
+        .gimbal_pos_az           (),
+        .gimbal_pos_el           (),
+        .convergence_time_100ms  (),
+        .signal_strength_filtered()
     );
 
     // =========================================================================
@@ -480,7 +634,30 @@ module top_cubesat_mvp #(
             end
         end
     end
-
+    
+    // Propagated Quaternion TLM (20 bytes): [q_prop_out × 4 × 2 bytes] + padding
+    // CS4 output packed for comparison with EKF estimate (q_est)
+    logic [7:0]  prop_tlm  [0:19];
+    logic        prop_tlm_valid;
+    
+    always_ff @(posedge clk_100mhz or negedge rst_n) begin
+        if (!rst_n) begin
+            for (int i = 0; i < 20; i++) prop_tlm[i] <= 8'h00;
+            prop_tlm_valid <= 1'b0;
+        end else begin
+            prop_tlm_valid <= q_prop_valid;
+            if (q_prop_valid) begin
+                // Propagated quaternion estimate (8 bytes, big-endian)
+                for (int i = 0; i < 4; i++) begin
+                    prop_tlm[i*2]     <= q_prop_out[i][15:8];
+                    prop_tlm[i*2 + 1] <= q_prop_out[i][7:0];
+                end
+                // Padding
+                for (int i = 8; i < 20; i++) prop_tlm[i] <= 8'h00;
+            end
+        end
+    end
+    
     // Orbit TLM (47 bytes): ECI pos (12 bytes) + ECI vel (12 bytes) + LVLH (12 bytes) + orb_valid
     logic [7:0]  orbit_tlm [0:46];
     logic        orbit_tlm_valid;
@@ -540,13 +717,13 @@ module top_cubesat_mvp #(
         end
     end
 
-    // HK TLM (16 bytes): health flags
-    logic [7:0]  hk_tlm [0:15];
+    // HK TLM (18 bytes): health flags (CS-TLM-007 requires 18-byte HK payload)
+    logic [7:0]  hk_tlm [0:17];
     logic        hk_tlm_valid;
 
     always_ff @(posedge clk_100mhz or negedge rst_n) begin
         if (!rst_n) begin
-            for (int i = 0; i < 16; i++) hk_tlm[i] <= 8'h00;
+            for (int i = 0; i < 18; i++) hk_tlm[i] <= 8'h00;
             hk_tlm_valid <= 1'b0;
         end else begin
             hk_tlm_valid <= ce_1hz;
@@ -555,7 +732,7 @@ module top_cubesat_mvp #(
                 hk_tlm[1]  <= {5'h00, adcs_mode_int};
                 hk_tlm[2]  <= {6'h00, ekf_fault, imu_fault};
                 hk_tlm[3]  <= {6'h00, orb_fault, actuator_fault_int};
-                for (int i = 4; i < 16; i++) hk_tlm[i] <= 8'h00;
+                for (int i = 4; i < 18; i++) hk_tlm[i] <= 8'h00;
             end
         end
     end
@@ -564,20 +741,43 @@ module top_cubesat_mvp #(
         .CLK_HZ  (CLK_HZ),
         .BAUD_HZ (115_200)
     ) u_cs11 (
-        .clk         (clk_100mhz),
-        .rst_n       (rst_n),
-        .ce_1hz      (ce_1hz),
-        .adcs_tlm    (adcs_tlm),
-        .adcs_valid  (adcs_tlm_valid),
-        .orbit_tlm   (orbit_tlm),
-        .orbit_valid (orbit_tlm_valid),
-        .laser_tlm   (laser_tlm),
-        .laser_valid (laser_tlm_valid),
-        .hk_tlm      (hk_tlm),
-        .hk_valid    (hk_tlm_valid),
-        .uart_tx     (tlm_uart_tx),
-        .tlm_valid   (tlm_valid),
-        .tlm_busy    ()
+        .clk          (clk_100mhz),
+        .rst_n        (rst_n),
+        .ce_1hz       (ce_1hz),
+        .ce_1ms       (ce_1khz),        // 1 kHz clock enable serves as 1 ms tick
+        .adcs_tlm     (adcs_tlm),
+        .adcs_valid   (adcs_tlm_valid),
+        .prop_tlm     (prop_tlm),          // ← ADD THIS
+        .prop_valid   (prop_tlm_valid),
+        .orbit_tlm    (orbit_tlm),
+        .orbit_valid  (orbit_tlm_valid),
+        .laser_tlm    (laser_tlm),
+        .laser_valid  (laser_tlm_valid),
+        .hk_tlm       (hk_tlm),
+        .hk_valid     (hk_tlm_valid),
+        .uptime_sec   (32'h0),          // tie off until MET counter connected
+        .uart_tx      (tlm_uart_tx),
+        .uart_rx      (1'b1),           // idle-high (no uplink in MVP)
+        // Decoded command outputs — unused in MVP
+        .cmd_valid    (),
+        .cmd_apid     (),
+        .cmd_code     (),
+        .cmd_data     (),
+        .cmd_data_len (),
+        .cmd_crc_error(),
+        .cmd_sync_error(),
+        // AXI4-Lite master — tie off in MVP
+        .axi_awaddr   (),
+        .axi_awvalid  (),
+        .axi_awready  (1'b1),
+        .axi_wdata    (),
+        .axi_wvalid   (),
+        .axi_wready   (1'b1),
+        .axi_bresp    (2'b00),
+        .axi_bvalid   (1'b0),
+        .axi_bready   (),
+        .tlm_valid    (tlm_valid),
+        .tlm_busy     ()
     );
 
     // =========================================================================
